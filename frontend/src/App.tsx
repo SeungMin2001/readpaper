@@ -11,7 +11,7 @@ type Tab = 'translation' | 'research' | 'questions' | 'vocabulary'
 
 const sourceLabels: Record<Source['kind'], string> = {
   paper: '현재 논문', referenced: '참고 논문', related: '관련 논문',
-  citing: '이 논문을 인용', background: '배경 지식',
+  citing: '이 논문을 인용', recent: '최신 관련 논문', background: '배경 지식',
 }
 
 function Brand() {
@@ -282,5 +282,6 @@ function ResearchPanel({ sources, warnings, summary }: { sources: Source[]; warn
 }
 
 function SourceCard({ source, excerpt = false }: { source: Source; excerpt?: boolean }) {
-  return <article className="source-card"><div className="source-card-top"><span className="source-kind">{sourceLabels[source.kind]}</span>{source.year && <span>{source.year}</span>}{source.page && <span>p. {source.page}</span>}</div><h3>{source.url ? <a href={source.url} target="_blank" rel="noopener noreferrer">{source.title} ↗</a> : source.title}</h3>{excerpt && source.excerpt && <p>{source.excerpt}</p>}</article>
+  const scope = source.content_scope === 'abstract' ? '초록' : source.content_scope === 'metadata' ? '서지 정보만' : null
+  return <article className="source-card"><div className="source-card-top"><span className="source-kind">{sourceLabels[source.kind]}</span>{scope && <span>{scope}</span>}{source.year && <span>{source.year}</span>}{source.page && <span>p. {source.page}</span>}</div><h3>{source.url ? <a href={source.url} target="_blank" rel="noopener noreferrer">{source.title} ↗</a> : source.title}</h3>{excerpt && source.excerpt && <p>{source.excerpt}</p>}</article>
 }

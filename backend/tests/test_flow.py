@@ -2,6 +2,7 @@ import os
 import asyncio
 import tempfile
 import unittest
+from datetime import date
 from pathlib import Path
 from unittest.mock import patch
 
@@ -16,7 +17,7 @@ from readpaper.config import Settings  # noqa: E402
 from readpaper.llm import InvalidModelOutput, validate_translation  # noqa: E402
 from readpaper.main import app  # noqa: E402
 from readpaper.pdf import extract_pdf  # noqa: E402
-from readpaper.rag import retrieve  # noqa: E402
+from readpaper.rag import build_chunks, retrieve  # noqa: E402
 from readpaper.sources import collect_external_sources, reconstruct_abstract  # noqa: E402
 
 
@@ -176,6 +177,13 @@ class ReadpaperFlowTests(unittest.TestCase):
 
         def respond(request):
             path = request.url.path
+            if path.endswith("/works") and "from_publication_date" in request.url.params.get("filter", ""):
+                return httpx.Response(200, json={"results": [
+                    {**work("W1", "Contextual Language Research"), "publication_date": date.today().isoformat()},
+                    {**work("W5", "Modern language model methods"), "publication_date": date.today().isoformat()},
+                    {**work("W6", "Old language model methods"), "publication_date": "2020-01-01"},
+                    {**work("W7", "Unrelated vision study"), "publication_date": date.today().isoformat()},
+                ]})
             if path.endswith("/works") and "search" in request.url.params:
                 return httpx.Response(200, json={"results": [{
                     **work("W1", "Contextual Language Research"),
@@ -205,9 +213,12 @@ class ReadpaperFlowTests(unittest.TestCase):
                 "A completely different subject", None, [],
             ))
         self.assertEqual([item["kind"] for item in sources], [
-            "referenced", "related", "citing", "background",
+            "referenced", "related", "citing", "recent", "background",
         ])
-        self.assertEqual(len({item["id"] for item in sources}), 4)
+        self.assertEqual(len({item["id"] for item in sources}), 5)
+        self.assertEqual(sources[3]["title"], "Modern language model methods")
+        self.assertEqual(sources[3]["content_scope"], "abstract")
+        self.assertIn(sources[3], build_chunks([], sources, "Uploaded paper"))
         self.assertFalse(warnings)
         self.assertFalse(any(item["kind"] != "background" for item in unrelated))
         self.assertTrue(unrelated_warnings)

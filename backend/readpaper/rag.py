@@ -11,6 +11,7 @@ def build_chunks(sentences: list[dict[str, Any]], external_sources: list[dict[st
         chunks.append({
             "id": f"paper-{offset // 3}", "kind": "paper", "title": paper_title,
             "text": " ".join(item["text"] for item in group),
+            "content_scope": "full_text",
             "url": None, "page": group[0]["page"] + 1,
         })
     chunks.extend(source for source in external_sources if source.get("text"))

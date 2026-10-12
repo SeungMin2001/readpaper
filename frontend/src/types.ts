@@ -36,8 +36,9 @@ export type SentenceTranslation = {
 
 export type Source = {
   id: string
-  kind: 'paper' | 'referenced' | 'related' | 'citing' | 'background'
+  kind: 'paper' | 'referenced' | 'related' | 'citing' | 'recent' | 'background'
   title: string
+  content_scope?: 'full_text' | 'abstract' | 'metadata' | 'background'
   url: string | null
   year?: number | null
   authors?: string[]
