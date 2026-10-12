@@ -1,0 +1,34 @@
+services:
+  web:
+    build: .
+    env_file: .env
+    volumes:
+      - readpaper-data:/data
+    restart: unless-stopped
+    networks:
+      - private
+
+  caddy:
+    image: caddy:2-alpine
+    environment:
+      READPAPER_DOMAIN: ${READPAPER_DOMAIN}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - web
+    restart: unless-stopped
+    networks:
+      - private
+
+networks:
+  private:
+
+volumes:
+  readpaper-data:
+  caddy-data:
+  caddy-config:
