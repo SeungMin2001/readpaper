@@ -183,6 +183,7 @@ class ReadpaperFlowTests(unittest.TestCase):
                     {**work("W5", "Modern language model methods"), "publication_date": date.today().isoformat()},
                     {**work("W6", "Old language model methods"), "publication_date": "2020-01-01"},
                     {**work("W7", "Unrelated vision study"), "publication_date": date.today().isoformat()},
+                    {**work("W8", "Future transformer attention method"), "publication_date": "2099-01-01"},
                 ]})
             if path.endswith("/works") and "search" in request.url.params:
                 return httpx.Response(200, json={"results": [{
@@ -218,6 +219,7 @@ class ReadpaperFlowTests(unittest.TestCase):
         self.assertEqual(len({item["id"] for item in sources}), 5)
         self.assertEqual(sources[3]["title"], "Modern language model methods")
         self.assertEqual(sources[3]["content_scope"], "abstract")
+        self.assertEqual(sources[3]["openalex_id"], "https://openalex.org/W5")
         self.assertIn(sources[3], build_chunks([], sources, "Uploaded paper"))
         self.assertFalse(warnings)
         self.assertFalse(any(item["kind"] != "background" for item in unrelated))

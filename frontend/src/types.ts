@@ -39,6 +39,9 @@ export type Source = {
   kind: 'paper' | 'referenced' | 'related' | 'citing' | 'recent' | 'background'
   title: string
   content_scope?: 'full_text' | 'abstract' | 'metadata' | 'background'
+  openalex_id?: string | null
+  doi?: string | null
+  publication_date?: string | null
   url: string | null
   year?: number | null
   authors?: string[]

@@ -40,9 +40,10 @@ def _paper_source(work: dict[str, Any], kind: str, index: int) -> dict[str, Any]
     ]
     return {
         "id": f"external-{index}", "kind": kind,
+        "openalex_id": work.get("id"), "doi": work.get("doi"),
         "title": work["display_name"],
         "text": abstract, "content_scope": "abstract" if abstract else "metadata", "url": url,
-        "year": work.get("publication_year"),
+        "year": work.get("publication_year"), "publication_date": work.get("publication_date"),
         "authors": [name for name in authors if name],
     }
 
@@ -115,13 +116,14 @@ async def collect_external_sources(title: str, doi: str | None, keywords: list[s
             warnings.append("OpenAlex에서 업로드 논문을 찾지 못해 참고·인용 관계를 확인하지 못했습니다.")
 
         if keywords:
+            today = date.today().isoformat()
             cutoff = (date.today() - timedelta(days=3 * 365)).isoformat()
             query = " ".join(keywords[:2])[:160]
             query_terms = set(re.findall(r"[a-z0-9]+", query.lower())) - {"and", "of", "the", "for", "in"}
             try:
                 response = await client.get(f"{settings.openalex_url}/works", params={
                     "search": query,
-                    "filter": f"from_publication_date:{cutoff}",
+                    "filter": f"from_publication_date:{cutoff},to_publication_date:{today}",
                     "sort": "publication_date:desc", "per-page": 20,
                 })
                 response.raise_for_status()
@@ -129,7 +131,7 @@ async def collect_external_sources(title: str, doi: str | None, keywords: list[s
                     if sum(source["kind"] == "recent" for source in sources) >= 5:
                         break
                     published = item.get("publication_date")
-                    if not isinstance(published, str) or published < cutoff:
+                    if not isinstance(published, str) or not cutoff <= published <= today:
                         continue
                     abstract = reconstruct_abstract(item.get("abstract_inverted_index"))
                     if not abstract:
