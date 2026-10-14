@@ -49,7 +49,7 @@ export default function App() {
   const [skipPreparation, setSkipPreparation] = useState(false)
   const [preparationAttempt, setPreparationAttempt] = useState(0)
   const [panel, setPanel] = useState<Panel>('assistant')
-  const [gloss, setGloss] = useState<{ original: string; meaning: string; sentence: string; contextCount?: number; elapsedMs?: number } | null>(null)
+  const [gloss, setGloss] = useState<{ original: string; meaning: string; sentence: string; contextSource?: WordGloss['context_source']; elapsedMs?: number } | null>(null)
   const [translated, setTranslated] = useState<Set<string>>(new Set())
   const [pendingWordIds, setPendingWordIds] = useState<Set<string>>(new Set())
   const [vocabulary, setVocabulary] = useState<VocabularyItem[]>([])
@@ -112,7 +112,7 @@ export default function App() {
         if (!active) return
         window.clearInterval(timer)
         setGlossPreparation({ status: 'failed', total: 0, ready: 0, failed: 0,
-          error: error.message, word_glosses: {} })
+          stage: 'failed', error: error.message, summary: null, word_glosses: {} })
       })
     }
     poll()
@@ -185,7 +185,7 @@ export default function App() {
     } catch (error) { setNotice((error as Error).message) }
   }
 
-  function revealGloss(unit: WordGloss, word: Word, contextCount?: number, elapsedMs?: number) {
+  function revealGloss(unit: WordGloss, word: Word, elapsedMs?: number) {
     const key = unit.word_ids.join(':')
     const wasTranslated = translated.has(key)
     setTranslated((previous) => {
@@ -199,7 +199,7 @@ export default function App() {
       return
     }
     const sentence = sentenceMap.get(unit.sentence_id || word.sentence_id)
-    setGloss({ original: unit.original, meaning: unit.meaning, sentence: sentence?.text || '', contextCount, elapsedMs })
+    setGloss({ original: unit.original, meaning: unit.meaning, sentence: sentence?.text || '', contextSource: unit.context_source, elapsedMs })
     setPanel('assistant')
     if (paper) {
       void api.saveWord({
@@ -221,6 +221,7 @@ export default function App() {
       const unit: WordGloss = {
         word_ids: result.word_ids, original: result.original,
         meaning: result.meaning, sentence_id: result.sentence_id,
+        context_source: result.context_source,
       }
       setPaper((previous) => previous ? {
         ...previous,
@@ -230,7 +231,7 @@ export default function App() {
           ...Object.fromEntries(unit.word_ids.map((id) => [id, unit])),
         },
       } : previous)
-      revealGloss(unit, word, result.context_count, result.elapsed_ms)
+      revealGloss(unit, word, result.elapsed_ms)
       return unit
     }).catch((error: Error) => {
       setNotice(error.message)
@@ -349,14 +350,15 @@ export default function App() {
         <main className="preparation-page" aria-live="polite">
           <div className="preparation-card">
             <p className="eyebrow">PREPARING YOUR PAPER</p>
-            <h1>{glossPreparation?.status === 'failed' ? '용어 준비가 멈췄습니다.' : '읽기 전에 용어를 준비하고 있어요.'}</h1>
+            <h1>{glossPreparation?.status === 'failed' ? '용어 준비가 멈췄습니다.' : glossPreparation?.stage === 'summarizing' ? '논문의 핵심을 요약하고 있어요.' : '읽기 전에 용어를 준비하고 있어요.'}</h1>
             <p className="preparation-title">{paper?.title || fileName}</p>
             <div className="preparation-progress" role="progressbar" aria-label="주요 용어 준비" aria-valuemin={0}
               aria-valuemax={glossPreparation?.total || 1} aria-valuenow={glossPreparation?.ready || 0}>
               <span style={{ width: `${glossPreparation?.total ? glossPreparation.ready / glossPreparation.total * 100 : 0}%` }} />
             </div>
             <p className="preparation-count"><strong>{glossPreparation?.ready || 0}</strong> / {glossPreparation?.total ?? '…'}개 주요 용어 준비됨</p>
-            <p className="preparation-note">논문 전체에서 주요 용어를 고른 뒤 문맥에 맞는 뜻을 저장합니다. 나머지 단어는 읽다가 누르면 번역합니다.</p>
+            {glossPreparation?.summary && <p className="preparation-summary">{glossPreparation.summary}</p>}
+            <p className="preparation-note">논문을 한 문장으로 요약해 저장한 뒤, 요약과 클릭한 단어만 모델에 보내 뜻을 준비합니다. 나머지 단어는 읽다가 누르면 번역합니다.</p>
             {glossPreparation?.status === 'failed' && <div className="preparation-actions">
               <p>{glossPreparation.error || '로컬 모델 연결을 확인해 주세요.'}</p>
               <button className="primary-button" onClick={() => { void retryPreparation() }}>다시 시도</button>
@@ -416,7 +418,7 @@ export default function App() {
 
               {panel === 'assistant' && <section className="dock-panel assistant-panel" role="tabpanel">
                 <div className="assistant-intro"><span className="assistant-avatar"><Icon name="spark" size={17} /></span><div><strong>논문 읽기 도우미</strong><p>논문의 내용과 수집한 자료를 바탕으로 답해요.</p></div></div>
-                {gloss && <div className="gloss-card"><div className="gloss-heading"><span>WORD IN CONTEXT</span><button onClick={() => setGloss(null)} aria-label="뜻 패널 닫기">×</button></div><div className="gloss-term">{gloss.original}<span>{gloss.meaning}</span></div>{gloss.sentence && <p>{gloss.sentence}</p>}<small className="gloss-context-note">논문 문맥 {gloss.contextCount ? `${gloss.contextCount}곳` : '기반'}{gloss.elapsedMs ? ` · ${ (gloss.elapsedMs / 1000).toFixed(1)}초` : ' · 저장된 뜻'}</small></div>}
+                {gloss && <div className="gloss-card"><div className="gloss-heading"><span>WORD IN CONTEXT</span><button onClick={() => setGloss(null)} aria-label="뜻 패널 닫기">×</button></div><div className="gloss-term">{gloss.original}<span>{gloss.meaning}</span></div>{gloss.sentence && <p>{gloss.sentence}</p>}<small className="gloss-context-note">{gloss.contextSource === 'paper_summary' ? '논문 핵심 요약 기반' : '논문 문맥 기반'}{gloss.elapsedMs ? ` · ${ (gloss.elapsedMs / 1000).toFixed(1)}초` : ' · 저장된 뜻'}</small></div>}
                 <div className="chat-scroll" ref={chatScroll}>
                   {turns.length === 0 ? <div className="chat-empty"><p className="chat-greeting">안녕하세요. 이 논문을 읽다가 막히는 부분이 있나요?</p><p>방법, 용어, 주장 사이의 관계를 물어보세요. 답변에는 근거 자료를 함께 표시합니다.</p><div className="prompt-list">{[
                     '이 논문이 해결하려는 문제는 무엇인가요?',

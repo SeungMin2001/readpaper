@@ -94,6 +94,7 @@ a { color: inherit; }
 .preparation-count { margin: 14px 0 0; color: #6a786d; font-size: 12px; }
 .preparation-count strong { color: var(--green-deep); font-size: 17px; }
 .preparation-note { margin: 22px 0 0; color: #879189; font-size: 11px; line-height: 1.75; }
+.preparation-summary { margin: 22px 0 0; padding: 13px 15px; border-left: 2px solid #8ca48b; background: #f3f5ef; color: #546a57; font-size: 12px; line-height: 1.7; }
 .preparation-actions { margin-top: 25px; display: flex; flex-wrap: wrap; gap: 9px; }
 .preparation-actions p { flex-basis: 100%; margin: 0 0 5px; color: #9a644d; font-size: 11px; line-height: 1.6; }
 

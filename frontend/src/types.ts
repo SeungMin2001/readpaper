@@ -28,14 +28,17 @@ export type WordGloss = {
   original: string
   meaning: string
   sentence_id: string
+  context_source?: 'paper_summary'
 }
 
 export type GlossPreparation = {
   status: 'pending' | 'queued' | 'running' | 'completed' | 'failed'
+  stage: 'pending' | 'queued' | 'summarizing' | 'translating' | 'completed' | 'failed'
   total: number
   ready: number
   failed: number
   error: string | null
+  summary: string | null
   word_glosses: Record<string, WordGloss>
 }
 

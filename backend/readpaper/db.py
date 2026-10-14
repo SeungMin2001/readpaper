@@ -90,14 +90,14 @@ def get_gloss_preparation(paper_id: str) -> dict[str, Any] | None:
     return dict(row) if row else None
 
 
-def claim_gloss_preparation(paper_id: str, total: int) -> bool:
+def claim_gloss_preparation(paper_id: str, total: int, *, force: bool = False) -> bool:
     """Only one request may launch or retry a preparation job."""
     with connect() as db:
         db.execute("BEGIN IMMEDIATE")
         row = db.execute(
             "SELECT status FROM gloss_preparation WHERE paper_id = ?", (paper_id,),
         ).fetchone()
-        if row and row["status"] != "failed":
+        if row and row["status"] != "failed" and not force:
             return False
         db.execute(
             "INSERT INTO gloss_preparation "

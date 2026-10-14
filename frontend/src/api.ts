@@ -31,7 +31,7 @@ export const api = {
   glossPreparation: (id: string) => request<GlossPreparation>(`/api/papers/${id}/gloss-preparation`),
   retryGlossPreparation: (id: string) => request<GlossPreparation>(`/api/papers/${id}/gloss-preparation`, { method: 'POST' }),
   retry: (id: string) => request<{ status: string }>(`/api/papers/${id}/retry`, { method: 'POST' }),
-  translateWord: (paperId: string, wordId: string) => request<WordGloss & { cached: boolean; elapsed_ms: number; context_count?: number; activity?: ActivityEvent[] }>(`/api/papers/${paperId}/translate-word`, {
+  translateWord: (paperId: string, wordId: string) => request<WordGloss & { cached: boolean; elapsed_ms: number; activity?: ActivityEvent[] }>(`/api/papers/${paperId}/translate-word`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ word_id: wordId }),
   }),

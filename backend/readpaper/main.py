@@ -17,7 +17,7 @@ from pydantic import BaseModel, Field
 from . import db
 from .config import settings
 from .gloss_preparation import select_paper_candidates
-from .llm import InvalidModelOutput, ModelUnavailable, VLLMClient
+from .llm import InvalidModelOutput, ModelUnavailable, VLLMClient, validate_keyword_gloss
 from .pdf import extract_pdf
 from .rag import build_chunks, retrieve
 from .sources import collect_external_sources
@@ -267,6 +267,31 @@ async def process_paper(paper_id: str) -> None:
 async def prepare_glosses(paper_id: str, word_ids: list[str]) -> None:
     """Translate selected terms concurrently so the upload has one observable job."""
     db.update_gloss_preparation(paper_id, status="running")
+    paper = db.get_paper(paper_id, touch=False)
+    if paper is None:
+        db.update_gloss_preparation(paper_id, status="failed", error="논문을 찾을 수 없습니다.")
+        return
+    data = paper["data"]
+    if not data.get("paper_summary"):
+        try:
+            summary = await VLLMClient().summarize_paper(
+                paper["title"], _paper_summary_source(data),
+            )
+            data["paper_summary"] = summary
+        except (ModelUnavailable, InvalidModelOutput) as exc:
+            db.update_gloss_preparation(paper_id, status="failed", error=str(exc))
+            return
+        except Exception:
+            logger.exception("Paper summary failed for paper %s", paper_id)
+            db.update_gloss_preparation(
+                paper_id, status="failed", error="논문 핵심 요약 중 오류가 발생했습니다.",
+            )
+            return
+    if data.get("gloss_context_version") != "paper_summary_v1":
+        db.merge_paper_data(paper_id, {
+            "paper_summary": data["paper_summary"],
+            "gloss_context_version": "paper_summary_v1",
+        })
     semaphore = asyncio.Semaphore(3)
     errors: list[str] = []
 
@@ -311,10 +336,35 @@ async def prepare_new_paper(paper_id: str, word_ids: list[str]) -> None:
             logger.error("Paper background job failed for %s: %s", paper_id, result)
 
 
+def _paper_summary_source(data: dict[str, Any]) -> str:
+    sentences = data.get("sentences", [])
+    body = []
+    for sentence in sentences:
+        text = sentence.get("text", "").strip()
+        if re.fullmatch(r"(?:references|bibliography|works cited)", text, re.IGNORECASE):
+            break
+        if text:
+            body.append(text)
+    if len(body) > 24:
+        selected = sorted({round(index * (len(body) - 1) / 23) for index in range(24)})
+        body = [body[index] for index in selected]
+    return "\n".join(body)[:9000]
+
+
 def _start_gloss_preparation(paper_id: str, data: dict[str, Any],
                              background: BackgroundTasks) -> None:
     word_ids = select_paper_candidates(data)
-    if db.claim_gloss_preparation(paper_id, len(word_ids)):
+    status = db.get_gloss_preparation(paper_id)
+    legacy_context = data.get("gloss_context_version") != "paper_summary_v1"
+    legacy_glosses = legacy_context and bool(data.get("word_glosses"))
+    if legacy_glosses:
+        # Older cached translations were generated from sentence passages, so
+        # clear them before preparing the same terms with the compact summary.
+        db.merge_paper_data(paper_id, {"word_glosses": {}})
+    force = legacy_context and bool(
+        status and status["status"] not in {"queued", "running"}
+    )
+    if db.claim_gloss_preparation(paper_id, len(word_ids), force=force):
         background.add_task(prepare_glosses, paper_id, word_ids)
 
 
@@ -383,8 +433,16 @@ def _gloss_preparation_response(paper_id: str) -> dict[str, Any]:
     if paper is None:
         raise HTTPException(status_code=404, detail="논문을 찾을 수 없습니다.")
     status = db.get_gloss_preparation(paper_id)
-    return (status or {"status": "pending", "total": 0, "ready": 0,
-                       "failed": 0, "error": None}) | {
+    preparation = status or {"status": "pending", "total": 0, "ready": 0,
+                             "failed": 0, "error": None}
+    current = paper["data"].get("paper_summary")
+    if preparation["status"] == "running":
+        stage = "translating" if current else "summarizing"
+    else:
+        stage = preparation["status"]
+    return preparation | {
+        "stage": stage,
+        "summary": current,
         "word_glosses": paper["data"].get("word_glosses", {}),
     }
 
@@ -453,9 +511,12 @@ async def _translate_word(paper_id: str, word_id: str,
     sentence = sentences[sentence_index]
     tokens = [known_words[word_id]["text"] for word_id in sentence["word_ids"]]
     focus_index = sentence["word_ids"].index(word_id)
-    context_started = time.monotonic()
-    passages = _word_context(sentences, word["text"], sentence["id"], data.get("chunks", []))
-    context_ms = round((time.monotonic() - context_started) * 1000)
+    paper_summary = data.get("paper_summary")
+    if not paper_summary:
+        raise HTTPException(
+            status_code=503,
+            detail="논문 핵심 요약을 준비하고 있습니다. 잠시 후 다시 시도해 주세요.",
+        )
 
     started = time.monotonic()
     async with _gloss_request_lock((paper_id, word["sentence_id"])):
@@ -470,9 +531,8 @@ async def _translate_word(paper_id: str, word_id: str,
             }
         model = VLLMClient()
         try:
-            result = await model.translate_keyword(
-                data["title"], sentence["text"], tokens, focus_index, passages,
-            )
+            result = await model.translate_keyword_from_summary(paper_summary, word["text"])
+            result = validate_keyword_gloss(result, tokens, focus_index)
         except (ModelUnavailable, InvalidModelOutput) as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
         model_request_ms = round((time.monotonic() - started) * 1000) - lock_wait_ms
@@ -492,6 +552,7 @@ async def _translate_word(paper_id: str, word_id: str,
             "original": " ".join(token for token in clean_term if token),
             "meaning": meaning.strip(),
             "sentence_id": sentence["id"],
+            "context_source": "paper_summary",
         }
         db.save_word_gloss(paper_id, word_ids, unit)
 
@@ -501,11 +562,11 @@ async def _translate_word(paper_id: str, word_id: str,
             paper_id, f"용어 뜻 생성: {unit['original']} · {elapsed_ms / 1000:.1f}초", "success",
         )
     return unit | {
-        "cached": False, "elapsed_ms": elapsed_ms, "context_count": len(passages),
+        "cached": False, "elapsed_ms": elapsed_ms,
         "timing": {
             "provider": "vllm",
             "model": settings.llm_model,
-            "context_ms": context_ms,
+            "context_ms": 0,
             "lock_wait_ms": lock_wait_ms,
             "model_request_ms": model_request_ms,
             "provider_request_ms": model_metrics.get("request_ms"),

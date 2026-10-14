@@ -92,6 +92,54 @@ class VLLMClient:
                 "READPAPER_LLM_BASE_URL과 READPAPER_LLM_MODEL 설정을 확인하세요."
             ) from exc
 
+    async def summarize_paper(self, title: str, paper_text: str) -> str:
+        """Create a compact, reusable topic cue once per uploaded paper."""
+        schema = {
+            "type": "object",
+            "properties": {"summary": {"type": "string"}},
+            "required": ["summary"],
+            "additionalProperties": False,
+        }
+        result = await self.chat_json(
+            "Summarize the scientific paper in exactly one concise English sentence. "
+            "Capture its problem, approach, and main finding when the text provides them. "
+            "Use only the supplied text; ignore references and do not invent results. "
+            'Return JSON {"summary":"..."} with no other fields.',
+            json.dumps({"title": title, "paper_text": paper_text}, ensure_ascii=False),
+            schema=schema,
+            options={"temperature": 0, "num_predict": 64},
+        )
+        summary = result.get("summary")
+        if (not isinstance(summary, str) or not summary.strip()
+                or len(summary) > 350 or "\n" in summary.strip()):
+            raise InvalidModelOutput("논문 핵심 요약을 한 문장으로 만들지 못했습니다.")
+        return summary.strip()
+
+    async def translate_keyword_from_summary(
+        self, paper_summary: str, clicked_token: str,
+    ) -> dict[str, Any]:
+        """Translate a clicked token using only the stored paper summary as context."""
+        schema = {
+            "type": "object",
+            "properties": {
+                "term": {"type": "string"},
+                "meaning": {"type": "string"},
+            },
+            "required": ["term", "meaning"],
+            "additionalProperties": False,
+        }
+        result = await self.chat_json(
+            "Using the paper's one-sentence core summary, give a short Korean gloss "
+            "for the clicked scientific term. Copy clicked_token as term unless the summary "
+            "clearly names a standard multiword term containing it; in that case return that "
+            "compound phrase. Do not explain or add other text. Return JSON with term and meaning.",
+            json.dumps({"paper_summary": paper_summary, "clicked_token": clicked_token},
+                       ensure_ascii=False),
+            schema=schema,
+            options={"temperature": 0, "num_predict": 48},
+        )
+        return result
+
     async def translate_keyword(
         self, title: str, sentence: str, tokens: list[str], focus_index: int,
         paper_passages: list[str],
