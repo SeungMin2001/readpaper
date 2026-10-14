@@ -24,6 +24,7 @@ RUN --mount=type=secret,id=build_ca,required=false \
       pip install --no-cache-dir -r /app/backend/requirements.txt; \
     fi
 COPY backend/readpaper /app/backend/readpaper
+COPY backend/scripts/benchmark_gloss.py /app/backend/scripts/benchmark_gloss.py
 COPY --from=frontend-build /app/frontend/dist /app/frontend/dist
 RUN mkdir -p /data && useradd --system --uid 10001 --home /data readpaper && chown -R readpaper:readpaper /app /data
 USER readpaper

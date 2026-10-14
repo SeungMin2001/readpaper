@@ -387,6 +387,7 @@ async def translate_word(paper_id: str, body: WordTranslationRequest,
     return unit | {
         "cached": False, "elapsed_ms": elapsed_ms, "context_count": len(passages),
         "timing": {
+            "model": settings.ollama_gloss_model,
             "context_ms": context_ms,
             "lock_wait_ms": lock_wait_ms,
             "model_request_ms": model_request_ms,

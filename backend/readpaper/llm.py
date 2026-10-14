@@ -35,6 +35,7 @@ class OllamaClient:
     async def chat_json(
         self, system: str, user: str, *, schema: dict[str, Any] | None = None,
         options: dict[str, Any] | None = None, keep_alive: str = "30m",
+        model: str | None = None,
     ) -> dict[str, Any]:
         self.last_metrics = {}
         try:
@@ -42,7 +43,7 @@ class OllamaClient:
                 response = await client.post(
                     f"{settings.ollama_url}/api/chat",
                     json={
-                        "model": settings.ollama_model,
+                        "model": model or settings.ollama_model,
                         "stream": False,
                         "format": schema or "json",
                         "think": False,
@@ -73,7 +74,7 @@ class OllamaClient:
 
     async def translate_keyword(
         self, title: str, sentence: str, tokens: list[str], focus_index: int,
-        paper_passages: list[str],
+        paper_passages: list[str], *, model: str | None = None,
     ) -> dict[str, Any]:
         if not tokens or not 0 <= focus_index < len(tokens):
             raise InvalidModelOutput("선택한 단어의 문장 위치가 올바르지 않습니다.")
@@ -89,24 +90,23 @@ class OllamaClient:
         }
         request = {
             "paper_title": title,
-            "clicked_token": {"index": focus_index, "text": tokens[focus_index]},
-            "sentence_tokens": [
-                {"index": index, "text": token} for index, token in enumerate(tokens)
-            ],
+            "focus_index": focus_index,
+            "tokens": tokens,
             "sentence": sentence,
-            "other_passages_from_this_paper": paper_passages,
+            "other_passages_from_this_paper": [
+                passage for passage in paper_passages if passage != sentence
+            ],
         }
         result = await self.chat_json(
-            "You are a concise dictionary for reading scientific papers. Translate ONLY the clicked "
-            "English keyword or technical term into a short Korean gloss; do not translate the sentence. "
-            "Use the paper title, the sentence, and retrieved passages from anywhere in the same paper "
-            "to resolve the author's intended sense. If the clicked token belongs to a standard "
-            "multiword technical term, return the smallest complete term span containing it. Otherwise "
-            "return only the clicked token. Do not include surrounding grammar words. Return token start "
-            "(inclusive), end (exclusive), and a natural short Korean meaning. Never explain your reasoning.",
+            "Give a short Korean gloss for the clicked scientific term. Use the paper title, "
+            "sentence, and other passages to choose its meaning. If the clicked token belongs "
+            "to a standard multiword technical term, select the smallest complete term span; "
+            "otherwise select only that token. Return zero-based token start (inclusive), "
+            "end (exclusive), and meaning. No explanation.",
             json.dumps(request, ensure_ascii=False),
             schema=schema,
             options={"temperature": 0, "num_ctx": 4096, "num_predict": 96},
+            model=model or settings.ollama_gloss_model,
         )
         return validate_keyword_gloss(result, len(tokens), focus_index)
 

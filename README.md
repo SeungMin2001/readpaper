@@ -16,7 +16,7 @@
 
 ## 개발 환경에서 실행
 
-Python 3.12와 Node.js 24가 필요합니다. Mac mini에서 Ollama를 실행하고 `gemma4:12b` 모델을 내려받습니다. Ollama와 모델은 Mac에서 로컬로 실행되며, 모델 파일은 Mac의 저장 공간을 사용합니다. 다른 모델을 쓰려면 `READPAPER_OLLAMA_MODEL` 환경 변수를 바꿉니다.
+Python 3.12와 Node.js 24가 필요합니다. Mac mini에서 Ollama를 실행하고 `gemma4:12b` 모델을 내려받습니다. Ollama와 모델은 Mac에서 로컬로 실행되며, 모델 파일은 Mac의 저장 공간을 사용합니다. 전체 모델을 바꾸려면 `READPAPER_OLLAMA_MODEL`, 클릭한 용어 번역에만 다른 모델을 쓰려면 `READPAPER_GLOSS_MODEL` 환경 변수를 설정합니다.
 
 ```bash
 ollama pull gemma4:12b
@@ -46,6 +46,15 @@ Vite 개발 서버의 `/api` 요청은 `localhost:8000`으로 전달됩니다. `
 `.env.example`을 `.env`로 복사해 사용자 이름, 긴 비밀번호, 무작위 세션 서명 키와 Ollama 주소를 채운 뒤 `docker compose up --build`를 실행합니다. `.env`는 Git에 포함되지 않습니다. 기본 Compose 설정은 웹 앱을 **서버 자신의 `127.0.0.1:8000`**에만 연결합니다. 인터넷에 공개할 때는 HTTPS 역방향 프록시를 앞에 둬야 하며 `READPAPER_SECURE_COOKIES=1`로 설정합니다.
 
 Mac mini와 클라우드 서버는 Tailscale 같은 인증된 전용 네트워크로 연결합니다. Mac의 Ollama 포트 `11434`를 공개 인터넷에 열지 마세요. 클라우드 컨테이너에서 Mac의 전용 네트워크 주소로 `/api/tags` 요청이 성공하는지 확인한 뒤 `READPAPER_OLLAMA_URL`을 그 주소로 설정합니다. 새로운 용어의 첫 번역이나 새 질문에 답할 때 Mac mini가 켜져 있어야 합니다. 이미 만든 용어 뜻은 저장본에서 조회하므로 Ollama를 다시 호출하지 않습니다. Ollama에는 모델을 30분 동안 메모리에 유지하도록 요청해 연속 클릭 때 재로딩을 줄입니다.
+
+용어 번역 속도와 뜻의 정확도를 같은 입력으로 비교하려면 Mac에서 `ollama pull gemma4:e2b`를 실행한 뒤 다음 명령을 사용합니다. 각 모델을 먼저 메모리에 올리고 실제 업로드 논문에서 이미 눌러 본 용어 최대 다섯 개의 번역 결과와 응답 시간 중앙값을 출력합니다. 저장된 뜻도 함께 출력되며 서비스의 모델 설정은 바뀌지 않습니다.
+
+```bash
+docker compose up -d --build
+docker compose exec web python /app/backend/scripts/benchmark_gloss.py --latest-paper gemma4:12b gemma4:e2b
+```
+
+뜻이 적절하고 응답 시간이 목표에 도달하면 `.env`에 `READPAPER_GLOSS_MODEL=gemma4:e2b`를 추가하고 `docker compose up -d --force-recreate web`을 실행합니다. 채팅과 관련 논문 판단은 계속 `READPAPER_OLLAMA_MODEL`을 사용합니다. 모델을 바꾼 직후 첫 요청에는 모델 로딩 시간이 추가될 수 있으므로 다음 요청부터 측정합니다.
 
 관련 자료 수집에는 `api.openalex.org`와 `en.wikipedia.org`로 나가는 HTTPS 연결이 필요합니다. 사설망 연결과 외부 자료 접근이 불가능할 때에도 오류가 설명되도록 구성했습니다. AWS EC2와 HTTPS 공개 배포 절차는 [배포 안내](docs/deployment.md)에 정리했습니다.
 
