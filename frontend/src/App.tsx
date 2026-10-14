@@ -1,21 +1,39 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type DragEvent } from 'react'
 import * as pdfjs from 'pdfjs-dist'
 import type { PDFDocumentProxy } from 'pdfjs-dist'
 import { api } from './api'
+import CitationGraph from './CitationGraph'
 import PdfReader from './PdfReader'
-import type { Answer, Paper, Sentence, Source, TranslationUnit, VocabularyItem, Word } from './types'
+import type { Answer, Paper, Source, TranslationUnit, VocabularyItem, Word } from './types'
 
 pdfjs.GlobalWorkerOptions.workerSrc = new URL('pdfjs-dist/build/pdf.worker.mjs', import.meta.url).toString()
 
-type Tab = 'translation' | 'research' | 'questions' | 'vocabulary'
+type Panel = 'assistant' | 'research' | 'vocabulary'
+type ChatTurn = { id: number; question: string; answer?: Answer; pending?: boolean }
 
 const sourceLabels: Record<Source['kind'], string> = {
-  paper: '현재 논문', referenced: '참고 논문', related: '관련 논문',
-  citing: '이 논문을 인용', recent: '최신 관련 논문', background: '배경 지식',
+  paper: '현재 논문', referenced: '참고 논문', related: '관련 연구',
+  citing: '인용한 논문', recent: '최신 연구', background: '배경 자료',
+}
+
+function Icon({ name, size = 18 }: { name: 'upload' | 'book' | 'chat' | 'network' | 'words' | 'send' | 'spark' | 'check' | 'search' | 'arrow'; size?: number }) {
+  const common = { width: size, height: size, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 1.7, strokeLinecap: 'round' as const, strokeLinejoin: 'round' as const, 'aria-hidden': true as const }
+  switch (name) {
+    case 'upload': return <svg {...common}><path d="M12 16V4m0 0L7.5 8.5M12 4l4.5 4.5"/><path d="M5 14v5a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-5"/></svg>
+    case 'book': return <svg {...common}><path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H20v17H6.5A2.5 2.5 0 0 0 4 22V5.5Z"/><path d="M4 17a2.5 2.5 0 0 1 2.5-2.5H20M8 7h8"/></svg>
+    case 'chat': return <svg {...common}><path d="M20 11.5a7.5 7.5 0 0 1-7.5 7.5H5l-1 2v-6.5A7.5 7.5 0 1 1 20 11.5Z"/><path d="M8 11h8M8 14h5"/></svg>
+    case 'network': return <svg {...common}><circle cx="12" cy="5" r="2.5"/><circle cx="5" cy="18" r="2.5"/><circle cx="19" cy="18" r="2.5"/><path d="m10.8 7.2-4.5 8.6m6.9-8.6 4.5 8.6M7.5 18h9"/></svg>
+    case 'words': return <svg {...common}><path d="M4 6h16M4 12h10M4 18h7"/><path d="m17 15 3 6m-6 0 3-6m-2.1 4h4.2"/></svg>
+    case 'send': return <svg {...common}><path d="m21 3-7.2 18-3.6-7.2L3 10.2 21 3Z"/><path d="M10.2 13.8 15 9"/></svg>
+    case 'spark': return <svg {...common}><path d="m12 3 1.4 5.6L19 10l-5.6 1.4L12 17l-1.4-5.6L5 10l5.6-1.4L12 3Z"/><path d="m19 16 .7 2.3L22 19l-2.3.7L19 22l-.7-2.3L16 19l2.3-.7L19 16Z"/></svg>
+    case 'check': return <svg {...common}><path d="m5 12 4 4L19 6"/></svg>
+    case 'search': return <svg {...common}><circle cx="10.8" cy="10.8" r="6.8"/><path d="m16 16 4.5 4.5"/></svg>
+    case 'arrow': return <svg {...common}><path d="M5 12h14m-6-6 6 6-6 6"/></svg>
+  }
 }
 
 function Brand() {
-  return <div className="brand"><span className="brand-mark">r<span>.</span></span><span>readpaper</span></div>
+  return <div className="brand"><span className="brand-mark">r</span><span>readpaper</span></div>
 }
 
 export default function App() {
@@ -27,19 +45,22 @@ export default function App() {
   const [pdf, setPdf] = useState<PDFDocumentProxy | null>(null)
   const [fileName, setFileName] = useState('')
   const [pageIndex, setPageIndex] = useState(0)
-  const [tab, setTab] = useState<Tab>('translation')
+  const [panel, setPanel] = useState<Panel>('assistant')
   const [mode, setMode] = useState<'word' | 'sentence'>('word')
   const [selectedSentence, setSelectedSentence] = useState<string | null>(null)
+  const [gloss, setGloss] = useState<{ original: string; meaning: string; sentence: string } | null>(null)
   const [translated, setTranslated] = useState<Set<string>>(new Set())
   const [vocabulary, setVocabulary] = useState<VocabularyItem[]>([])
   const [question, setQuestion] = useState('')
-  const [answer, setAnswer] = useState<Answer | null>(null)
+  const [turns, setTurns] = useState<ChatTurn[]>([])
   const [asking, setAsking] = useState(false)
   const [uploading, setUploading] = useState(false)
+  const [dragging, setDragging] = useState(false)
   const [notice, setNotice] = useState('')
   const [manualTerm, setManualTerm] = useState('')
   const [manualMeaning, setManualMeaning] = useState('')
   const fileInput = useRef<HTMLInputElement>(null)
+  const chatScroll = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
     api.me().then((result) => setUser(result.username)).catch(() => setUser(null))
@@ -64,26 +85,24 @@ export default function App() {
       })
     }
     poll()
-    const timer = window.setInterval(poll, 2500)
+    const timer = window.setInterval(poll, 2000)
     return () => { active = false; window.clearInterval(timer) }
   }, [paperId, paper?.status])
 
   useEffect(() => {
-    if (!paperId || paper?.status !== 'ready') return
-    const timer = window.setInterval(() => {
-      void api.paper(paperId).catch(() => undefined)
-    }, 5 * 60 * 1000)
-    return () => window.clearInterval(timer)
-  }, [paperId, paper?.status])
+    chatScroll.current?.scrollTo({ top: chatScroll.current.scrollHeight, behavior: 'smooth' })
+  }, [turns, asking])
 
   const sentenceMap = useMemo(
     () => new Map((paper?.sentences || []).map((sentence) => [sentence.id, sentence])),
     [paper?.sentences],
   )
   const currentSentence = selectedSentence ? sentenceMap.get(selectedSentence) : undefined
+  const currentTranslation = currentSentence ? paper?.translations?.[currentSentence.id]?.translation : undefined
   const currentPage = paper?.pages?.[pageIndex]
+  const canAsk = Boolean(paperId && paper?.status === 'ready')
 
-  async function doLogin(event: React.FormEvent<HTMLFormElement>) {
+  async function doLogin(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
     setNotice('')
     try {
@@ -96,29 +115,33 @@ export default function App() {
   async function upload(file: File) {
     setNotice('')
     setUploading(true)
+    setPdf(null)
+    setFileName('')
     setPaper(null)
     setPaperId(null)
-    setPdf(null)
     setTranslated(new Set())
     setSelectedSentence(null)
-    setAnswer(null)
+    setGloss(null)
+    setTurns([])
+    setPanel('assistant')
+    setPageIndex(0)
     try {
+      if (file.size > 25 * 1024 * 1024) throw new Error('PDF는 25MB 이하로 업로드해 주세요.')
       const bytes = new Uint8Array(await file.arrayBuffer())
       const loaded = await pdfjs.getDocument({ data: bytes }).promise
-      const result = await api.upload(file)
       setPdf(loaded)
       setFileName(file.name)
-      setPageIndex(0)
+      const result = await api.upload(file)
       setPaperId(result.paper_id)
       setPaper(await api.paper(result.paper_id))
-      if (result.cached) setNotice('기존 분석 결과를 불러왔습니다.')
+      if (result.cached) setNotice('이전에 분석한 논문을 불러왔습니다.')
     } catch (error) { setNotice((error as Error).message) }
     finally { setUploading(false) }
   }
 
   function chooseSentence(id: string) {
     setSelectedSentence(id)
-    setTab('translation')
+    setPanel('assistant')
   }
 
   function toggleWord(key: string, unit: TranslationUnit, word: Word) {
@@ -129,8 +152,14 @@ export default function App() {
       else next.add(key)
       return next
     })
-    if (!wasTranslated && paper) {
-      const sentence = sentenceMap.get(word.sentence_id)
+    if (wasTranslated) {
+      setGloss(null)
+      return
+    }
+    const sentence = sentenceMap.get(word.sentence_id)
+    setGloss({ original: unit.original, meaning: unit.meaning, sentence: sentence?.text || '' })
+    setPanel('assistant')
+    if (paper) {
       void api.saveWord({
         paper_title: paper.title, term: unit.original,
         meaning: unit.meaning, source_sentence: sentence?.text || '',
@@ -138,18 +167,25 @@ export default function App() {
     }
   }
 
-  async function ask(event: React.FormEvent<HTMLFormElement>) {
+  async function ask(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
-    if (!paperId || !question.trim()) return
+    const prompt = question.trim()
+    if (!paperId || !prompt || !canAsk) return
+    const id = Date.now()
+    setTurns((previous) => [...previous, { id, question: prompt, pending: true }])
+    setQuestion('')
     setAsking(true)
-    setAnswer(null)
     setNotice('')
-    try { setAnswer(await api.ask(paperId, question.trim())) }
-    catch (error) { setNotice((error as Error).message) }
-    finally { setAsking(false) }
+    try {
+      const result = await api.ask(paperId, prompt)
+      setTurns((previous) => previous.map((turn) => turn.id === id ? { ...turn, answer: result, pending: false } : turn))
+    } catch (error) {
+      setTurns((previous) => previous.map((turn) => turn.id === id ? { ...turn, pending: false } : turn))
+      setNotice((error as Error).message)
+    } finally { setAsking(false) }
   }
 
-  async function saveManual(event: React.FormEvent<HTMLFormElement>) {
+  async function saveManual(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
     try {
       await api.saveWord({
@@ -162,110 +198,150 @@ export default function App() {
     } catch (error) { setNotice((error as Error).message) }
   }
 
-  if (user === undefined) return <div className="center-message">readpaper를 준비하고 있습니다…</div>
+  function handleDrop(event: DragEvent<HTMLElement>) {
+    event.preventDefault()
+    setDragging(false)
+    const file = event.dataTransfer.files[0]
+    if (file) void upload(file)
+  }
+
+  if (user === undefined) return <div className="boot-screen"><span className="boot-mark">r</span><span>readpaper</span></div>
 
   if (!user) return (
     <div className="login-page">
       <div className="login-card">
         <Brand />
-        <p className="eyebrow">YOUR RESEARCH READING SPACE</p>
-        <h1>영문 논문을<br />내 속도로 읽다.</h1>
-        <p className="muted">논문의 맥락을 이해한 번역으로, 모르는 단어에서 멈추지 마세요.</p>
+        <p className="eyebrow">A QUIETER WAY TO READ</p>
+        <h1>논문을 읽는<br /><em>나만의 자리</em></h1>
+        <p className="muted">읽다가 막히는 순간, 맥락을 잃지 않고 뜻을 확인하세요.</p>
         <form onSubmit={doLogin} className="login-form">
           <label>아이디<input value={loginName} onChange={(event) => setLoginName(event.target.value)} autoComplete="username" required /></label>
           <label>비밀번호<input type="password" value={loginPassword} onChange={(event) => setLoginPassword(event.target.value)} autoComplete="current-password" required /></label>
-          <button className="primary-button" type="submit">읽기 시작하기 <span>↗</span></button>
+          <button className="primary-button" type="submit">읽기 시작하기 <Icon name="arrow" size={16} /></button>
         </form>
         {notice && <p className="inline-error">{notice}</p>}
       </div>
-      <div className="login-art" aria-hidden="true"><span className="art-circle" /><span className="art-quote">Read between<br />the lines.</span><span className="art-small">RESEARCH, REIMAGINED.</span></div>
+      <div className="login-side"><span className="login-index">READPAPER / 01</span><p>Good research<br />takes <em>time.</em></p><span className="login-caption">TAKE YOURS.</span></div>
     </div>
   )
+
+  const sourceCounts = countSources(paper?.sources || [])
 
   return (
     <div className="app-shell">
       <header className="site-header">
         <Brand />
         <div className="header-right">
-          {paper?.status === 'ready' && <span className="status-pill"><span className="status-dot" /> 분석 완료</span>}
+          {paper?.status === 'ready' && <span className="header-state"><span className="status-dot" /> 읽을 준비가 됐어요</span>}
           <span className="user-name">{user}</span>
-          <button className="text-button" onClick={() => { void api.logout().then(() => { setUser(null); setPaper(null); setPdf(null) }) }}>로그아웃</button>
+          <button className="text-button" onClick={() => { void api.logout().then(() => { setUser(null); setPaper(null); setPaperId(null); setPdf(null); setFileName('') }) }}>로그아웃</button>
         </div>
       </header>
 
-      {!paperId ? (
-        <main className="welcome">
-          <div className="welcome-copy">
-            <p className="eyebrow"><span className="eyebrow-line" /> YOUR PAPER, YOUR PACE</p>
-            <h1>영문 논문을<br /><em>내 속도로</em> 읽다.</h1>
-            <p>원문의 흐름은 유지하고, 필요한 순간에만 뜻을 확인합니다.<br />논문을 이해한 번역과 근거 있는 답변을 한 공간에서.</p>
-            <button className="primary-button upload-button" disabled={uploading} onClick={() => fileInput.current?.click()}>
-              {uploading ? 'PDF 업로드 중…' : 'PDF 논문 열기'} <span>↗</span>
-            </button>
-            <p className="upload-note">텍스트를 선택할 수 있는 PDF · 최대 25MB</p>
-          </div>
-          <div className="welcome-visual" aria-hidden="true">
-            <div className="visual-paper">
-              <div className="visual-head">ABSTRACT <span>01 / 12</span></div>
-              <h2>Understanding complex ideas, one word at a time.</h2>
-              <div className="visual-rule" />
-              <p>Recent advances in <span className="visual-highlight">representation learning</span> have opened new possibilities for scientific discovery.</p>
-              <div className="visual-lines"><i /><i /><i /><i /></div>
-              <div className="visual-translation"><span>✓</span> 표현 학습</div>
-            </div>
-          </div>
+      {!pdf ? (
+        <main className="welcome-page">
+          <section className="welcome-copy">
+            <p className="eyebrow"><span className="eyebrow-line" /> A SPACE FOR SLOW READING</p>
+            <h1>논문을 읽는 일에<br />더 많은 <em>여백</em>을.</h1>
+            <p className="welcome-description">원문을 따라가다 모르는 단어를 만나면 바로 뜻을 보고,<br className="desktop-break" /> 이해가 막히면 논문에 다시 물어보세요.</p>
+            <div className="welcome-notes"><span><i>01</i> 원문 그대로 읽기</span><span><i>02</i> 문맥 안에서 뜻 확인</span><span><i>03</i> 인용 관계 따라가기</span></div>
+          </section>
+          <section
+            className={`upload-card ${dragging ? 'upload-card--dragging' : ''}`}
+            onDragOver={(event) => { event.preventDefault(); setDragging(true) }}
+            onDragLeave={() => setDragging(false)}
+            onDrop={handleDrop}
+          >
+            <div className="upload-card-top"><span>START WITH A PAPER</span><span>PDF / UP TO 25 MB</span></div>
+            <div className="upload-illustration" aria-hidden="true"><div className="upload-sheet"><span /><span /><span /><span /></div><div className="upload-arrow"><Icon name="upload" size={21} /></div></div>
+            <h2>읽고 싶은 논문을<br />여기에 놓아주세요.</h2>
+            <p>텍스트를 선택할 수 있는 PDF 파일을 업로드합니다.</p>
+            <button className="primary-button" disabled={uploading} onClick={() => fileInput.current?.click()}>{uploading ? 'PDF를 여는 중…' : 'PDF 파일 선택'}<Icon name="arrow" size={16} /></button>
+            <div className="drop-hint">또는 파일을 이 영역으로 끌어오세요</div>
+          </section>
           <input ref={fileInput} hidden type="file" accept="application/pdf,.pdf" onChange={(event) => { const file = event.target.files?.[0]; if (file) void upload(file); event.currentTarget.value = '' }} />
-          {notice && <p className="inline-error welcome-error">{notice}</p>}
+          <div className="welcome-footer"><span>READPAPER — RESEARCH, AT YOUR PACE</span><span>01 / YOUR READING SPACE</span></div>
+          {notice && <div className="toast" role="status">{notice}<button onClick={() => setNotice('')} aria-label="닫기">×</button></div>}
         </main>
       ) : (
         <main className="workspace">
           <div className="paper-toolbar">
+            <div className="paper-heading-icon"><Icon name="book" size={20} /></div>
             <div className="paper-title-block"><p className="eyebrow">NOW READING</p><h1 title={paper?.title}>{paper?.title || fileName}</h1><span>{fileName}</span></div>
-            <button className="secondary-button" onClick={() => fileInput.current?.click()}>+ 새 PDF</button>
+            <div className="toolbar-actions">
+              {paper?.status === 'ready' && <span className="ready-label"><span className="status-dot" /> READY</span>}
+              <button className="secondary-button" onClick={() => fileInput.current?.click()}><span>＋</span> 새 논문</button>
+            </div>
             <input ref={fileInput} hidden type="file" accept="application/pdf,.pdf" onChange={(event) => { const file = event.target.files?.[0]; if (file) void upload(file); event.currentTarget.value = '' }} />
           </div>
-          {paper?.status !== 'ready' ? (
-            <section className="processing-card">
-              <div className="processing-orbit">◎</div>
-              <p className="eyebrow">PAPER ANALYSIS</p>
-              <h2>{paper?.status === 'failed' ? '분석을 마치지 못했습니다' : '논문의 맥락을 읽고 있습니다'}</h2>
-              <p>{paper?.status === 'failed' ? paper.error : '문장과 전문 용어를 분석하고, 관련 연구를 수집해 번역을 준비합니다.'}</p>
-              {paper?.status !== 'failed' && <div className="progress-track"><div style={{ width: `${paper?.progress || 0}%` }} /></div>}
-              {paper?.status !== 'failed' && <span className="progress-label">{paper?.progress || 0}% 완료</span>}
-              {paper?.status === 'failed' && <button className="primary-button" onClick={() => { if (paperId) void api.retry(paperId).then(() => setPaper({ ...paper, status: 'processing', progress: 0 })).catch((error: Error) => setNotice(error.message)) }}>다시 시도</button>}
+
+          <AnalysisTimeline paper={paper} paperId={paperId} uploading={uploading} onRetry={() => {
+            if (!paperId || !paper) return
+            void api.retry(paperId).then(() => setPaper({ ...paper, status: 'processing', progress: 0, error: null })).catch((error: Error) => setNotice(error.message))
+          }} />
+
+          <div className="reader-layout">
+            <section className="reader-main" aria-label="논문 읽기">
+              <div className="reader-controls">
+                <div className="reader-label"><span className="live-dot" /> ORIGINAL PAPER</div>
+                <div className="mode-switch" role="group" aria-label="읽기 모드">
+                  <button className={mode === 'word' ? 'active' : ''} onClick={() => setMode('word')}>단어 뜻</button>
+                  <button className={mode === 'sentence' ? 'active' : ''} onClick={() => setMode('sentence')}>문장 번역</button>
+                </div>
+                <div className="page-nav">
+                  <button disabled={pageIndex === 0} onClick={() => setPageIndex(Math.max(0, pageIndex - 1))} aria-label="이전 페이지">‹</button>
+                  <span>{pageIndex + 1}<i>/</i>{pdf.numPages}</span>
+                  <button disabled={pageIndex + 1 >= pdf.numPages} onClick={() => setPageIndex(Math.min(pdf.numPages - 1, pageIndex + 1))} aria-label="다음 페이지">›</button>
+                </div>
+              </div>
+              <p className="reader-hint">{mode === 'word' ? '모르는 단어를 누르면 원문 위에서 뜻을 확인할 수 있어요.' : '문장을 눌러 오른쪽에서 문맥에 맞는 번역을 확인하세요.'}{paper?.status !== 'ready' && <span> · 분석 중에도 원문을 먼저 읽을 수 있습니다.</span>}</p>
+              <div className="pdf-stage">
+                <PdfReader
+                  document={pdf} pageIndex={pageIndex} page={currentPage}
+                  sentences={paper?.sentences || []} translations={paper?.translations || {}}
+                  translated={translated} selectedSentence={selectedSentence} mode={mode}
+                  onWord={toggleWord} onSentence={chooseSentence}
+                />
+              </div>
+              <div className="reader-foot"><span><Icon name="book" size={14} /> {paper?.pages?.length || pdf.numPages} PAGES</span><span>클릭한 단어는 내 단어장에 저장됩니다</span></div>
             </section>
-          ) : (
-            <div className="reader-layout">
-              <section className="reader-main">
-                <div className="reader-controls">
-                  <div className="mode-switch" role="group" aria-label="읽기 모드">
-                    <button className={mode === 'word' ? 'active' : ''} onClick={() => setMode('word')}>단어 · 용어</button>
-                    <button className={mode === 'sentence' ? 'active' : ''} onClick={() => setMode('sentence')}>문장 선택</button>
-                  </div>
-                  <div className="page-nav">
-                    <button disabled={pageIndex === 0} onClick={() => setPageIndex(pageIndex - 1)} aria-label="이전 페이지">‹</button>
-                    <span>{pageIndex + 1} <span className="page-slash">/</span> {paper.pages?.length || pdf?.numPages || 0}</span>
-                    <button disabled={pageIndex + 1 >= (paper.pages?.length || 0)} onClick={() => setPageIndex(pageIndex + 1)} aria-label="다음 페이지">›</button>
-                  </div>
+
+            <aside className="research-dock" aria-label="논문 도구">
+              <div className="dock-header">
+                <div><p className="eyebrow">READING DESK</p><h2>논문과 함께</h2></div>
+                <span className="dock-status"><i /> LOCAL</span>
+              </div>
+              <div className="dock-tabs" role="tablist" aria-label="읽기 도구">
+                <button role="tab" aria-selected={panel === 'assistant'} className={panel === 'assistant' ? 'active' : ''} onClick={() => setPanel('assistant')}><Icon name="chat" size={16} /><span>대화</span></button>
+                <button role="tab" aria-selected={panel === 'research'} className={panel === 'research' ? 'active' : ''} onClick={() => setPanel('research')}><Icon name="network" size={16} /><span>인용 지도</span>{sourceCounts.references + sourceCounts.citing > 0 && <b>{sourceCounts.references + sourceCounts.citing}</b>}</button>
+                <button role="tab" aria-selected={panel === 'vocabulary'} className={panel === 'vocabulary' ? 'active' : ''} onClick={() => setPanel('vocabulary')}><Icon name="words" size={16} /><span>단어장</span></button>
+              </div>
+
+              {panel === 'assistant' && <section className="dock-panel assistant-panel" role="tabpanel">
+                <div className="assistant-intro"><span className="assistant-avatar"><Icon name="spark" size={17} /></span><div><strong>논문 읽기 도우미</strong><p>논문의 내용과 수집한 자료를 바탕으로 답해요.</p></div></div>
+                {gloss && <div className="gloss-card"><div className="gloss-heading"><span>WORD IN CONTEXT</span><button onClick={() => setGloss(null)} aria-label="뜻 패널 닫기">×</button></div><div className="gloss-term">{gloss.original}<span>{gloss.meaning}</span></div>{gloss.sentence && <p>{gloss.sentence}</p>}</div>}
+                {currentSentence && currentTranslation && <div className="sentence-card"><div className="card-kicker">PAGE {currentSentence.page + 1} · SENTENCE</div><p className="sentence-original">{currentSentence.text}</p><p className="sentence-korean">{currentTranslation}</p></div>}
+                <div className="chat-scroll" ref={chatScroll}>
+                  {turns.length === 0 ? <div className="chat-empty"><p className="chat-greeting">안녕하세요. 이 논문을 읽다가 막히는 부분이 있나요?</p><p>방법, 용어, 주장 사이의 관계를 물어보세요. 답변에는 근거 자료를 함께 표시합니다.</p><div className="prompt-list">{[
+                    '이 논문이 해결하려는 문제는 무엇인가요?',
+                    '핵심 방법을 간단히 설명해줘',
+                    '이 연구의 한계는 무엇인가요?',
+                  ].map((prompt) => <button key={prompt} onClick={() => setQuestion(prompt)} disabled={!canAsk}>{prompt}<Icon name="arrow" size={13} /></button>)}</div></div> : <div className="chat-turns">{turns.map((turn) => <div className="chat-turn" key={turn.id}>
+                    <div className="user-bubble">{turn.question}</div>
+                    {turn.pending ? <div className="thinking-line"><span /><span /><span /> 답변을 준비하고 있어요</div> : turn.answer ? <div className="assistant-bubble"><p>{turn.answer.answer}</p>{turn.answer.sources.length > 0 && <div className="answer-sources"><span>근거 자료</span>{turn.answer.sources.map((source) => <SourceCard key={source.id} source={source} compact excerpt />)}</div>}</div> : null}
+                  </div>)}</div>}
                 </div>
-                <p className="reader-hint">{mode === 'word' ? '단어 또는 전문 용어를 눌러 뜻을 확인하세요. 다시 누르면 원문으로 돌아갑니다.' : '문장 안의 단어를 눌러 오른쪽에서 문장 번역을 확인하세요.'}</p>
-                {pdf && currentPage && <PdfReader document={pdf} page={currentPage} sentences={paper.sentences || []} translations={paper.translations || {}} translated={translated} selectedSentence={selectedSentence} mode={mode} onWord={toggleWord} onSentence={chooseSentence} />}
-              </section>
-              <aside className="reader-aside">
-                <div className="aside-tabs" role="tablist" aria-label="논문 도구">
-                  {([['translation', '문장 번역'], ['research', '관련 자료'], ['questions', '질문'], ['vocabulary', '단어장']] as [Tab, string][]).map(([key, label]) => (
-                    <button key={key} role="tab" aria-selected={tab === key} className={tab === key ? 'active' : ''} onClick={() => setTab(key)}>{label}</button>
-                  ))}
-                </div>
-                <div className="aside-content">
-                  {tab === 'translation' && <TranslationPanel sentence={currentSentence} translation={currentSentence ? paper.translations?.[currentSentence.id]?.translation : undefined} />}
-                  {tab === 'research' && <ResearchPanel sources={paper.sources || []} warnings={paper.source_warnings || []} summary={paper.profile?.summary || ''} />}
-                  {tab === 'questions' && <div className="panel-section"><p className="eyebrow">ASK WITH EVIDENCE</p><h2>논문에 질문하기</h2><p className="muted">현재 논문과 수집한 관련 자료를 검색해 근거와 함께 답합니다. 이 기능은 Mac mini의 모델 서버가 켜져 있어야 합니다.</p><form className="question-form" onSubmit={ask}><textarea value={question} onChange={(event) => setQuestion(event.target.value)} placeholder="예: 이 논문의 방법이 기존 연구와 다른 점은?" rows={4} required /><button className="primary-button" disabled={asking}>{asking ? '근거를 찾는 중…' : '질문하기'} <span>↗</span></button></form>{answer && <div className="answer-box"><p>{answer.answer}</p>{answer.sources.length > 0 && <><h3>근거 자료</h3>{answer.sources.map((source) => <SourceCard key={source.id} source={source} excerpt />)}</>}</div>}</div>}
-                  {tab === 'vocabulary' && <div className="panel-section"><p className="eyebrow">YOUR WORDS</p><h2>나의 단어장 <span className="count">{vocabulary.length}</span></h2><p className="muted">뜻을 확인한 단어는 자동으로 모입니다.</p><form className="manual-form" onSubmit={saveManual}><input value={manualTerm} onChange={(event) => setManualTerm(event.target.value)} placeholder="직접 추가할 단어" required /><input value={manualMeaning} onChange={(event) => setManualMeaning(event.target.value)} placeholder="한국어 뜻" required /><button className="secondary-button" type="submit">단어 추가</button></form><div className="vocab-list">{vocabulary.map((item) => <article className="vocab-item" key={item.id}><div><strong>{item.term}</strong><span>{item.meaning}</span></div>{item.source_sentence && <p>{item.source_sentence}</p>}<small>{item.paper_title}</small><button aria-label={`${item.term} 삭제`} onClick={() => { void api.deleteWord(item.id).then(refreshVocabulary).catch((error: Error) => setNotice(error.message)) }}>×</button></article>)}{vocabulary.length === 0 && <p className="empty-note">논문에서 모르는 단어를 눌러보세요.</p>}</div></div>}
-                </div>
-              </aside>
-            </div>
-          )}
+                <form className="chat-form" onSubmit={ask}>
+                  {!canAsk && <p className="chat-disabled-note">논문 분석이 끝나면 질문할 수 있어요.</p>}
+                  <div className="chat-input-wrap"><input value={question} onChange={(event) => setQuestion(event.target.value)} placeholder={canAsk ? '논문에 대해 질문하기…' : '분석이 끝나면 질문을 입력하세요'} disabled={!canAsk || asking} /><button type="submit" disabled={!canAsk || asking || !question.trim()} aria-label="질문 보내기"><Icon name="send" size={17} /></button></div>
+                  <div className="chat-disclaimer">답변은 논문 자료를 검색해 구성됩니다. 원문과 근거를 함께 확인하세요.</div>
+                </form>
+              </section>}
+
+              {panel === 'research' && <ResearchPanel title={paper?.title || fileName} sources={paper?.sources || []} warnings={paper?.source_warnings || []} status={paper?.status || (uploading ? 'processing' : 'processing')} />}
+              {panel === 'vocabulary' && <div className="dock-panel vocabulary-panel" role="tabpanel"><div className="panel-title-row"><div><p className="eyebrow">YOUR READING NOTES</p><h2>나의 단어장 <span className="count">{vocabulary.length}</span></h2></div></div><p className="panel-copy">논문을 읽으며 확인한 단어가 모입니다.</p><form className="manual-form" onSubmit={saveManual}><input value={manualTerm} onChange={(event) => setManualTerm(event.target.value)} placeholder="단어" required /><input value={manualMeaning} onChange={(event) => setManualMeaning(event.target.value)} placeholder="뜻" required /><button className="secondary-button" type="submit">추가</button></form><div className="vocab-list">{vocabulary.map((item) => <article className="vocab-item" key={item.id}><div><strong>{item.term}</strong><span>{item.meaning}</span></div>{item.source_sentence && <p>{item.source_sentence}</p>}<small>{item.paper_title}</small><button aria-label={`${item.term} 삭제`} onClick={() => { void api.deleteWord(item.id).then(refreshVocabulary).catch((error: Error) => setNotice(error.message)) }}>×</button></article>)}{vocabulary.length === 0 && <div className="empty-research"><span><Icon name="words" size={24} /></span><p>논문에서 모르는 단어를 눌러보세요.</p></div>}</div></div>}
+            </aside>
+          </div>
           {notice && <div className="toast" role="status">{notice}<button onClick={() => setNotice('')} aria-label="닫기">×</button></div>}
         </main>
       )}
@@ -273,15 +349,55 @@ export default function App() {
   )
 }
 
-function TranslationPanel({ sentence, translation }: { sentence?: Sentence; translation?: string }) {
-  return <div className="panel-section"><p className="eyebrow">IN CONTEXT</p><h2>문장 번역</h2>{sentence && translation ? <><p className="panel-meta">PAGE {sentence.page + 1}</p><div className="sentence-original">{sentence.text}</div><div className="sentence-divider">↓</div><div className="sentence-korean">{translation}</div></> : <div className="empty-panel"><span>“</span><p>문장 선택 모드에서<br />논문의 문장을 눌러보세요.</p></div>}</div>
+function countSources(sources: Source[]) {
+  return {
+    references: sources.filter((source) => source.kind === 'referenced').length,
+    citing: sources.filter((source) => source.kind === 'citing').length,
+    related: sources.filter((source) => source.kind === 'related' || source.kind === 'recent').length,
+  }
 }
 
-function ResearchPanel({ sources, warnings, summary }: { sources: Source[]; warnings: string[]; summary: string }) {
-  return <div className="panel-section"><p className="eyebrow">CONNECTED RESEARCH</p><h2>관련 자료</h2>{summary && <div className="summary-card"><span>논문 맥락 요약</span><p>{summary}</p></div>}{warnings.map((warning) => <p className="source-warning" key={warning}>{warning}</p>)}<div className="source-list">{sources.map((source) => <SourceCard key={source.id} source={source} />)}{sources.length === 0 && <p className="empty-note">수집된 외부 자료가 없습니다. 현재 논문만으로도 질문할 수 있습니다.</p>}</div><p className="source-footnote">외부 논문은 공개된 서지 정보와 초록을 사용합니다. 전문을 수집한 것으로 표시하지 않습니다.</p></div>
+function AnalysisTimeline({ paper, paperId, uploading, onRetry }: { paper: Paper | null; paperId: string | null; uploading: boolean; onRetry: () => void }) {
+  const status = paper?.status
+  const progress = paper?.progress || 0
+  const activeStep = status === 'ready' ? 3 : progress < 8 ? 0 : progress < 12 ? 1 : 2
+  const steps = ['논문 구조 읽기', '인용·관련 연구 찾기', '문장별 번역 준비']
+  const counts = countSources(paper?.sources || [])
+  return <section className={`analysis-timeline ${status === 'failed' ? 'analysis-timeline--failed' : ''}`} aria-label="논문 분석 진행">
+    <div className="timeline-summary"><div className="timeline-title"><span className="timeline-symbol"><Icon name={status === 'ready' ? 'check' : 'network'} size={17} /></span><div><span className="timeline-kicker">PAPER PROCESS</span><strong>{status === 'ready' ? '분석이 끝났습니다' : status === 'failed' ? '분석을 마치지 못했습니다' : uploading && !paperId ? 'PDF를 읽을 준비 중입니다' : '논문을 차례로 살펴보고 있어요'}</strong></div></div>
+      <div className="timeline-detail">{status === 'ready' ? <><b>{counts.references}</b>편 참고 <i>·</i> <b>{counts.citing}</b>편 피인용 <i>·</i> <b>{counts.related}</b>편 관련 자료</> : status === 'failed' ? paper?.error : '원문을 먼저 열었습니다. 분석이 진행되는 동안에도 읽을 수 있어요.'}</div>
+    </div>
+    <div className="timeline-steps">{steps.map((label, index) => {
+      const complete = activeStep > index
+      const active = activeStep === index && status !== 'failed'
+      return <div className={`timeline-step ${complete ? 'complete' : ''} ${active ? 'active' : ''}`} key={label}><span className="timeline-step-marker">{complete ? <Icon name="check" size={13} /> : String(index + 1).padStart(2, '0')}</span><div className="timeline-step-copy"><strong>{label}</strong><span>{index === 0 ? '제목과 문장 구조' : index === 1 ? '참고문헌과 연구 관계' : '원문 문맥을 반영'}</span></div></div>
+    })}</div>
+    {status === 'failed' && paperId && <button className="retry-button" onClick={onRetry}>다시 시도</button>}
+  </section>
 }
 
-function SourceCard({ source, excerpt = false }: { source: Source; excerpt?: boolean }) {
-  const scope = source.content_scope === 'abstract' ? '초록' : source.content_scope === 'metadata' ? '서지 정보만' : null
-  return <article className="source-card"><div className="source-card-top"><span className="source-kind">{sourceLabels[source.kind]}</span>{scope && <span>{scope}</span>}{source.year && <span>{source.year}</span>}{source.page && <span>p. {source.page}</span>}</div><h3>{source.url ? <a href={source.url} target="_blank" rel="noopener noreferrer">{source.title} ↗</a> : source.title}</h3>{excerpt && source.excerpt && <p>{source.excerpt}</p>}</article>
+function ResearchPanel({ title, sources, warnings, status }: { title: string; sources: Source[]; warnings: string[]; status: Paper['status'] }) {
+  const [query, setQuery] = useState('')
+  const counts = countSources(sources)
+  const citationsReady = status === 'ready'
+  const related = sources.filter((source) => source.kind === 'related' || source.kind === 'recent')
+  const searchable = sources.filter((source) => source.kind !== 'background')
+  const filtered = searchable.filter((source) => `${source.title} ${(source.authors || []).join(' ')}`.toLowerCase().includes(query.toLowerCase()))
+  return <div className="dock-panel research-panel" role="tabpanel">
+    <div className="research-panel-heading"><p className="eyebrow">PAPER CONNECTIONS</p><h2>인용 지도</h2><p>논문 사이의 인용 관계를 한눈에 봅니다.</p></div>
+    {!citationsReady ? <div className="graph-wait"><div className="graph-wait-mark"><Icon name="network" size={26} /></div><strong>관계를 찾고 있습니다</strong><p>분석이 끝나면 참고문헌과 피인용 논문을 그래프로 보여드릴게요.</p></div> : <>
+      <div className="graph-counts"><div><strong>{counts.references}</strong><span>찾은 참고문헌</span></div><div><strong>{counts.citing}</strong><span>찾은 피인용</span></div><div><strong>{counts.related}</strong><span>관련 연구 후보</span></div></div>
+      <div className="citation-graph-card"><div className="graph-card-heading"><div><strong>직접 인용 관계</strong><span>화살표는 인용 방향을 나타냅니다</span></div><div className="graph-legend"><i className="legend-reference" />인용<i className="legend-citing" />피인용</div></div><CitationGraph title={title} sources={sources} /></div>
+      <div className="research-results-heading"><div><p className="eyebrow">DISCOVERED PAPERS</p><h3>찾은 연구 <span>{searchable.length}</span></h3></div><label className="source-search"><Icon name="search" size={15} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="제목으로 검색" /></label></div>
+      {warnings.map((warning) => <p className="source-warning" key={warning}>{warning}</p>)}
+      {related.length > 0 && <div className="related-note"><strong>관련 연구 후보</strong><span>인용 기록이 확인된 연결만 그래프에 표시합니다.</span></div>}
+      <div className="source-list">{filtered.map((source) => <SourceCard key={source.id} source={source} compact />)}{filtered.length === 0 && <p className="empty-note">검색 결과가 없습니다.</p>}</div>
+      <p className="source-footnote">자료마다 초록 또는 서지 정보만 제공될 수 있습니다. 전문 수집 여부는 별도로 확인하세요.</p>
+    </>}
+  </div>
+}
+
+function SourceCard({ source, excerpt = false, compact = false }: { source: Source; excerpt?: boolean; compact?: boolean }) {
+  const scope = source.content_scope === 'full_text' ? '전문' : source.content_scope === 'abstract' ? '초록' : source.content_scope === 'metadata' ? '서지 정보' : null
+  return <article className={`source-card ${compact ? 'source-card--compact' : ''}`}><div className="source-card-top"><span className={`source-kind source-kind--${source.kind}`}>{sourceLabels[source.kind]}</span>{scope && <span>{scope}</span>}{source.year && <span>{source.year}</span>}</div><h3>{source.url ? <a href={source.url} target="_blank" rel="noopener noreferrer">{source.title}<Icon name="arrow" size={12} /></a> : source.title}</h3>{source.authors && source.authors.length > 0 && <p className="source-authors">{source.authors.join(', ')}</p>}{excerpt && source.excerpt && <p className="source-excerpt">{source.excerpt}</p>}</article>
 }

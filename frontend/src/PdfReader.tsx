@@ -6,7 +6,8 @@ type UnitReference = { key: string; unit: TranslationUnit; first: boolean }
 
 type Props = {
   document: PDFDocumentProxy
-  page: PaperPage
+  pageIndex: number
+  page?: PaperPage
   sentences: Sentence[]
   translations: Record<string, SentenceTranslation>
   translated: Set<string>
@@ -17,12 +18,13 @@ type Props = {
 }
 
 export default function PdfReader({
-  document, page, sentences, translations, translated,
+  document, pageIndex, page, sentences, translations, translated,
   selectedSentence, mode, onWord, onSentence,
 }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const frameRef = useRef<HTMLDivElement>(null)
   const [scale, setScale] = useState(1)
+  const [dimensions, setDimensions] = useState({ width: 0, height: 0 })
   const [renderError, setRenderError] = useState('')
 
   useEffect(() => {
@@ -41,10 +43,12 @@ export default function PdfReader({
       while (requested && !cancelled) {
         requested = false
         try {
-          const pdfPage = await document.getPage(page.index + 1)
+          const pdfPage = await document.getPage(pageIndex + 1)
           if (cancelled) break
           const width = Math.min(frame.clientWidth, 920)
-          const nextScale = width / page.width
+          const baseViewport = pdfPage.getViewport({ scale: 1 })
+          setDimensions({ width: baseViewport.width, height: baseViewport.height })
+          const nextScale = width / (page?.width || baseViewport.width)
           const viewport = pdfPage.getViewport({ scale: nextScale })
           const pixelRatio = Math.min(window.devicePixelRatio || 1, 2)
           canvas.width = Math.floor(viewport.width * pixelRatio)
@@ -83,7 +87,7 @@ export default function PdfReader({
       observer.disconnect()
       renderTask?.cancel()
     }
-  }, [document, page.index, page.width])
+  }, [document, pageIndex, page?.index, page?.width])
 
   const byWord = useMemo(() => {
     const map = new Map<string, UnitReference>()
@@ -102,9 +106,9 @@ export default function PdfReader({
 
   return (
     <div ref={frameRef} className="pdf-frame">
-      <div className="pdf-page" style={{ width: page.width * scale, height: page.height * scale }}>
-        <canvas ref={canvasRef} className="pdf-canvas" aria-label={`논문 ${page.index + 1}페이지`} />
-        {page.words.map((word) => {
+      <div className="pdf-page" style={{ width: (page?.width || dimensions.width) * scale, height: (page?.height || dimensions.height) * scale }}>
+        <canvas ref={canvasRef} className="pdf-canvas" aria-label={`논문 ${pageIndex + 1}페이지`} />
+        {(page?.words || []).map((word) => {
           const ref = byWord.get(word.id)
           const active = Boolean(ref && translated.has(ref.key))
           const isSelected = selectedSentence === word.sentence_id
