@@ -198,14 +198,20 @@ def validate_keyword_gloss(
         and end <= token_count and start <= focus_index < end
     )
     if not valid_span and type(start) is int and type(end) is int:
-        # Some model responses use one-based token positions despite the prompt.
-        # Convert only when the adjusted range is valid and includes the clicked token.
-        adjusted_start, adjusted_end = start - 1, end - 1
-        if (adjusted_start >= 0 and adjusted_end > adjusted_start
-                and adjusted_end <= token_count
-                and adjusted_start <= focus_index < adjusted_end):
-            start, end = adjusted_start, adjusted_end
-            valid_span = True
+        # Models sometimes return one-based positions or an inclusive end index.
+        # Try common conventions, accepting only a valid range containing the click.
+        alternatives = (
+            (start - 1, end - 1),  # one-based, exclusive end
+            (start, end + 1),       # zero-based, inclusive end
+            (start - 1, end),       # one-based, inclusive end
+        )
+        for adjusted_start, adjusted_end in alternatives:
+            if (adjusted_start >= 0 and adjusted_end > adjusted_start
+                    and adjusted_end <= token_count
+                    and adjusted_start <= focus_index < adjusted_end):
+                start, end = adjusted_start, adjusted_end
+                valid_span = True
+                break
     if not valid_span:
         raise InvalidModelOutput("용어 범위가 선택한 단어를 포함하지 않거나 문장 범위를 벗어났습니다.")
     if not isinstance(meaning, str) or not meaning.strip() or len(meaning) > 100:

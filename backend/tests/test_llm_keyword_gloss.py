@@ -80,6 +80,20 @@ class KeywordGlossTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result, {"start": 1, "end": 2, "meaning": "학습"})
 
+    def test_corrects_inclusive_end_span_when_it_covers_clicked_token(self):
+        result = validate_keyword_gloss(
+            {"start": 1, "end": 1, "meaning": "학습"}, token_count=4, focus_index=1,
+        )
+
+        self.assertEqual(result, {"start": 1, "end": 2, "meaning": "학습"})
+
+    def test_corrects_one_based_inclusive_span_when_it_covers_clicked_token(self):
+        result = validate_keyword_gloss(
+            {"start": 2, "end": 2, "meaning": "학습"}, token_count=4, focus_index=1,
+        )
+
+        self.assertEqual(result, {"start": 1, "end": 2, "meaning": "학습"})
+
     def test_does_not_correct_one_based_span_if_it_still_misses_clicked_token(self):
         with self.assertRaises(InvalidModelOutput):
             validate_keyword_gloss(
