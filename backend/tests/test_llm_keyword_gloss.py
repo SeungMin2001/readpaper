@@ -2,7 +2,9 @@ import json
 import sys
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
+
+import httpx
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -10,6 +12,33 @@ from readpaper.llm import InvalidModelOutput, OllamaClient, validate_keyword_glo
 
 
 class KeywordGlossTests(unittest.IsolatedAsyncioTestCase):
+    async def test_captures_ollama_timing_metadata(self):
+        response_payload = {
+            "message": {"content": '{"start":0,"end":1,"meaning":"주의"}'},
+            "total_duration": 900_000_000,
+            "load_duration": 100_000_000,
+            "prompt_eval_duration": 300_000_000,
+            "eval_duration": 450_000_000,
+            "prompt_eval_count": 400,
+            "eval_count": 20,
+        }
+        transport = httpx.MockTransport(
+            lambda _request: httpx.Response(200, json=response_payload),
+        )
+        real_async_client = httpx.AsyncClient
+        client = OllamaClient()
+
+        with patch(
+            "readpaper.llm.httpx.AsyncClient",
+            side_effect=lambda **kwargs: real_async_client(transport=transport, **kwargs),
+        ):
+            result = await client.chat_json("system", "user")
+
+        self.assertEqual(result["meaning"], "주의")
+        self.assertEqual(client.last_metrics["total_duration"], 900_000_000)
+        self.assertEqual(client.last_metrics["prompt_eval_count"], 400)
+        self.assertEqual(client.last_metrics["eval_count"], 20)
+
     async def test_requests_only_short_contextual_keyword_gloss(self):
         client = OllamaClient()
         client.chat_json = AsyncMock(return_value={

@@ -150,6 +150,9 @@ class ReadpaperFlowTests(unittest.TestCase):
                     self.assertEqual(first_unit["original"], "Reinforcement learning")
                     self.assertEqual(first_unit["meaning"], "강화학습")
                     self.assertEqual(len(first_unit["word_ids"]), 2)
+                    self.assertIn("timing", first_unit)
+                    self.assertIsNotNone(first_unit["timing"]["context_ms"])
+                    self.assertIsNone(first_unit["timing"]["ollama_total_ms"])
                     self.assertGreaterEqual(len(fake_model.last_passages), 1)
                     cached_gloss = client.post(
                         f"/api/papers/{paper_id}/translate-word", json={"word_id": "w1"},

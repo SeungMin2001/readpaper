@@ -338,10 +338,13 @@ async def translate_word(paper_id: str, body: WordTranslationRequest,
     sentence = sentences[sentence_index]
     tokens = [known_words[word_id]["text"] for word_id in sentence["word_ids"]]
     focus_index = sentence["word_ids"].index(body.word_id)
+    context_started = time.monotonic()
     passages = _word_context(sentences, word["text"], sentence["id"], data.get("chunks", []))
+    context_ms = round((time.monotonic() - context_started) * 1000)
 
     started = time.monotonic()
     async with _ollama_lock:
+        lock_wait_ms = round((time.monotonic() - started) * 1000)
         # Another click may have completed while this request waited for the local model.
         latest = db.get_paper(paper_id, touch=False)
         cached = (latest or {}).get("data", {}).get("word_glosses", {}).get(body.word_id)
@@ -357,6 +360,8 @@ async def translate_word(paper_id: str, body: WordTranslationRequest,
             )
         except (ModelUnavailable, InvalidModelOutput) as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
+        model_request_ms = round((time.monotonic() - started) * 1000) - lock_wait_ms
+        model_metrics = getattr(model, "last_metrics", {})
 
         start, end = result.get("start"), result.get("end")
         meaning = result.get("meaning")
@@ -381,6 +386,21 @@ async def translate_word(paper_id: str, body: WordTranslationRequest,
     )
     return unit | {
         "cached": False, "elapsed_ms": elapsed_ms, "context_count": len(passages),
+        "timing": {
+            "context_ms": context_ms,
+            "lock_wait_ms": lock_wait_ms,
+            "model_request_ms": model_request_ms,
+            "ollama_total_ms": round(model_metrics["total_duration"] / 1_000_000)
+            if "total_duration" in model_metrics else None,
+            "ollama_load_ms": round(model_metrics["load_duration"] / 1_000_000)
+            if "load_duration" in model_metrics else None,
+            "prompt_eval_ms": round(model_metrics["prompt_eval_duration"] / 1_000_000)
+            if "prompt_eval_duration" in model_metrics else None,
+            "generation_ms": round(model_metrics["eval_duration"] / 1_000_000)
+            if "eval_duration" in model_metrics else None,
+            "prompt_tokens": model_metrics.get("prompt_eval_count"),
+            "generated_tokens": model_metrics.get("eval_count"),
+        },
         "activity": db.list_paper_activity(paper_id),
     }
 

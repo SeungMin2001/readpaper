@@ -29,10 +29,14 @@ def _parse_json(content: str) -> dict[str, Any]:
 
 
 class OllamaClient:
+    def __init__(self) -> None:
+        self.last_metrics: dict[str, int] = {}
+
     async def chat_json(
         self, system: str, user: str, *, schema: dict[str, Any] | None = None,
         options: dict[str, Any] | None = None, keep_alive: str = "30m",
     ) -> dict[str, Any]:
+        self.last_metrics = {}
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(240.0, connect=10.0)) as client:
                 response = await client.post(
@@ -51,7 +55,16 @@ class OllamaClient:
                     },
                 )
                 response.raise_for_status()
-                return _parse_json(response.json()["message"]["content"])
+                payload = response.json()
+                self.last_metrics = {
+                    key: payload[key]
+                    for key in (
+                        "total_duration", "load_duration", "prompt_eval_duration",
+                        "eval_duration", "prompt_eval_count", "eval_count",
+                    )
+                    if isinstance(payload.get(key), int)
+                }
+                return _parse_json(payload["message"]["content"])
         except (httpx.HTTPError, KeyError, TypeError, ValueError) as exc:
             raise ModelUnavailable(
                 "Mac mini의 Ollama 서버에 연결하거나 응답을 읽을 수 없습니다. "
