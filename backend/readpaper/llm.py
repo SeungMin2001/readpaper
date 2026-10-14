@@ -129,52 +129,15 @@ class VLLMClient:
             "additionalProperties": False,
         }
         result = await self.chat_json(
-            "Using the paper's one-sentence core summary, give a short Korean gloss "
-            "for the clicked scientific term. Copy clicked_token as term unless the summary "
-            "clearly names a standard multiword term containing it; in that case return that "
-            "compound phrase. Do not explain or add other text. Return JSON with term and meaning.",
+            "Translate clicked_token into a concise Korean gloss using paper_summary. "
+            "Copy clicked_token as term unless the summary clearly identifies a multiword "
+            "scientific term containing it. Return only JSON with term and meaning; no explanation.",
             json.dumps({"paper_summary": paper_summary, "clicked_token": clicked_token},
                        ensure_ascii=False),
             schema=schema,
-            options={"temperature": 0, "num_predict": 48},
+            options={"temperature": 0, "num_predict": 32},
         )
         return result
-
-    async def translate_keyword(
-        self, title: str, sentence: str, tokens: list[str], focus_index: int,
-        paper_passages: list[str],
-    ) -> dict[str, Any]:
-        if not tokens or not 0 <= focus_index < len(tokens):
-            raise InvalidModelOutput("선택한 단어의 문장 위치가 올바르지 않습니다.")
-        schema = {
-            "type": "object",
-            "properties": {
-                "term": {"type": "string"},
-                "meaning": {"type": "string"},
-            },
-            "required": ["term", "meaning"],
-            "additionalProperties": False,
-        }
-        request = {
-            "paper_title": title,
-            "sentence": sentence,
-            "clicked_token": tokens[focus_index],
-            "before_clicked_token": tokens[max(0, focus_index - 3):focus_index],
-            "after_clicked_token": tokens[focus_index + 1:focus_index + 4],
-            "other_passages_from_this_paper": [
-                passage for passage in paper_passages if passage != sentence
-            ],
-        }
-        result = await self.chat_json(
-            "Return the exact English scientific term containing clicked_token and its short "
-            "Korean meaning as JSON with keys term and meaning. Include adjacent modifiers "
-            "when they form a compound term. Copy term from the sentence, and use the paper "
-            "context to choose its meaning. No explanation.",
-            json.dumps(request, ensure_ascii=False),
-            schema=schema,
-            options={"temperature": 0, "num_predict": 96},
-        )
-        return validate_keyword_gloss(result, tokens, focus_index)
 
     async def search_query(self, korean_question: str) -> str:
         result = await self.chat_json(

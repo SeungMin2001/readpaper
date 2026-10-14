@@ -43,34 +43,23 @@ class KeywordGlossTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.last_metrics["prompt_tokens"], 400)
         self.assertEqual(client.last_metrics["completion_tokens"], 20)
 
-    async def test_requests_only_short_contextual_keyword_gloss(self):
+    async def test_translation_sends_only_summary_and_clicked_token(self):
         client = VLLMClient()
         client.chat_json = AsyncMock(return_value={
             "term": "Reinforcement learning", "meaning": "강화학습",
         })
 
-        result = await client.translate_keyword(
-            "A Paper About Control",
-            "Reinforcement learning improves robotic control.",
-            ["Reinforcement", "learning", "improves", "robotic", "control."],
-            1,
-            [
-                "Reinforcement learning improves robotic control.",
-                "The agent learns a policy from rewards.",
-                "We evaluate learned policies.",
-            ],
+        result = await client.translate_keyword_from_summary(
+            "The paper studies reinforcement learning for robotic control.",
+            "Reinforcement",
         )
 
-        self.assertEqual(result, {"start": 0, "end": 2, "meaning": "강화학습"})
+        self.assertEqual(result["meaning"], "강화학습")
         args, kwargs = client.chat_json.await_args
         request = json.loads(args[1])
-        self.assertEqual(request["clicked_token"], "learning")
-        self.assertEqual(request["before_clicked_token"], ["Reinforcement"])
-        self.assertEqual(request["after_clicked_token"], ["improves", "robotic", "control."])
-        self.assertNotIn("tokens", request)
-        self.assertEqual(len(request["other_passages_from_this_paper"]), 2)
-        self.assertEqual(kwargs["options"]["num_predict"], 96)
-        self.assertEqual(set(kwargs["schema"]["properties"]), {"term", "meaning"})
+        self.assertEqual(set(request), {"paper_summary", "clicked_token"})
+        self.assertEqual(request["clicked_token"], "Reinforcement")
+        self.assertEqual(kwargs["options"]["num_predict"], 32)
 
     def test_matches_repeated_term_at_clicked_occurrence(self):
         result = validate_keyword_gloss(

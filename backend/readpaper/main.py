@@ -16,7 +16,6 @@ from pydantic import BaseModel, Field
 
 from . import db
 from .config import settings
-from .gloss_preparation import select_paper_candidates
 from .llm import InvalidModelOutput, ModelUnavailable, VLLMClient, validate_keyword_gloss
 from .pdf import extract_pdf
 from .rag import build_chunks, retrieve
@@ -33,7 +32,7 @@ _gloss_locks_guard = asyncio.Lock()
 
 @asynccontextmanager
 async def _gloss_request_lock(key: tuple[str, str]):
-    """Deduplicate the same term while allowing vLLM to batch different requests."""
+    """Deduplicate concurrent requests for the same source word."""
     async with _gloss_locks_guard:
         lock = _gloss_locks.setdefault(key, asyncio.Lock())
         _gloss_lock_users[key] = _gloss_lock_users.get(key, 0) + 1
@@ -105,41 +104,6 @@ def require_user(request: Request) -> str:
     if not _session_valid(request.cookies.get("readpaper_session")):
         raise HTTPException(status_code=401, detail="로그인이 필요합니다.")
     return settings.username
-
-
-def _word_context(sentences: list[dict[str, Any]], word: str, sentence_id: str,
-                  chunks: list[dict[str, Any]]) -> list[str]:
-    """Gather compact evidence from the clicked sentence and the full paper."""
-    selected = next((index for index, item in enumerate(sentences) if item["id"] == sentence_id), None)
-    if selected is None:
-        return []
-
-    contexts = [sentences[selected]["text"]]
-    normalized = re.sub(r"^\W+|\W+$", "", word).casefold()
-    matches = []
-    for index, sentence in enumerate(sentences):
-        if index == selected:
-            continue
-        if any(re.sub(r"^\W+|\W+$", "", token).casefold() == normalized
-               for token in sentence["text"].split()):
-            matches.append(index)
-
-    # Spread repeated occurrences across the paper to preserve document-level sense.
-    if len(matches) > 3:
-        matches = [matches[round(offset * (len(matches) - 1) / 2)] for offset in range(3)]
-    contexts.extend(sentences[index]["text"] for index in matches)
-
-    # Add a few lexically related passages when the term appears only once.
-    if len(contexts) < 4:
-        paper_chunks = [chunk for chunk in chunks if chunk.get("kind") == "paper"]
-        related = retrieve(f"{word} {sentences[selected]['text']}", paper_chunks, limit=5)
-        for item in related:
-            excerpt = item.get("text", "")
-            if excerpt and excerpt not in contexts:
-                contexts.append(excerpt)
-            if len(contexts) == 4:
-                break
-    return [context[:900] for context in contexts[:4]]
 
 
 _cleanup_task: asyncio.Task[None] | None = None
@@ -264,8 +228,8 @@ async def process_paper(paper_id: str) -> None:
         raise
 
 
-async def prepare_glosses(paper_id: str, word_ids: list[str]) -> None:
-    """Translate selected terms concurrently so the upload has one observable job."""
+async def prepare_paper_summary(paper_id: str) -> None:
+    """Create and persist one compact paper summary before opening the reader."""
     db.update_gloss_preparation(paper_id, status="running")
     paper = db.get_paper(paper_id, touch=False)
     if paper is None:
@@ -292,43 +256,13 @@ async def prepare_glosses(paper_id: str, word_ids: list[str]) -> None:
             "paper_summary": data["paper_summary"],
             "gloss_context_version": "paper_summary_v1",
         })
-    semaphore = asyncio.Semaphore(3)
-    errors: list[str] = []
-
-    async def prepare_one(word_id: str) -> None:
-        async with semaphore:
-            try:
-                await _translate_word(paper_id, word_id, record_activity=False)
-                db.update_gloss_preparation(paper_id, ready_delta=1)
-            except HTTPException as exc:
-                errors.append(str(exc.detail))
-                db.update_gloss_preparation(paper_id, failed_delta=1)
-            except Exception:
-                logger.exception("Gloss preparation failed for paper %s, word %s", paper_id, word_id)
-                errors.append("용어 번역 중 예기치 못한 오류가 발생했습니다.")
-                db.update_gloss_preparation(paper_id, failed_delta=1)
-
-    try:
-        await asyncio.gather(*(prepare_one(word_id) for word_id in word_ids))
-        ready = db.get_gloss_preparation(paper_id)
-        if ready and ready["ready"] == 0 and ready["failed"]:
-            db.update_gloss_preparation(paper_id, status="failed", error=errors[0])
-        else:
-            db.update_gloss_preparation(
-                paper_id, status="completed", error=errors[0] if errors else None,
-            )
-    except Exception:
-        logger.exception("Gloss preparation job failed for paper %s", paper_id)
-        db.update_gloss_preparation(
-            paper_id, status="failed", error="용어 준비 중 예기치 못한 오류가 발생했습니다.",
-        )
-        raise
+    db.update_gloss_preparation(paper_id, status="completed")
 
 
-async def prepare_new_paper(paper_id: str, word_ids: list[str]) -> None:
-    # External source discovery may be slow; local term preparation can run now.
+async def prepare_new_paper(paper_id: str) -> None:
+    # Source discovery and the one-time summary can run independently.
     results = await asyncio.gather(
-        process_paper(paper_id), prepare_glosses(paper_id, word_ids),
+        process_paper(paper_id), prepare_paper_summary(paper_id),
         return_exceptions=True,
     )
     for result in results:
@@ -353,7 +287,6 @@ def _paper_summary_source(data: dict[str, Any]) -> str:
 
 def _start_gloss_preparation(paper_id: str, data: dict[str, Any],
                              background: BackgroundTasks) -> None:
-    word_ids = select_paper_candidates(data)
     status = db.get_gloss_preparation(paper_id)
     legacy_context = data.get("gloss_context_version") != "paper_summary_v1"
     legacy_glosses = legacy_context and bool(data.get("word_glosses"))
@@ -364,8 +297,8 @@ def _start_gloss_preparation(paper_id: str, data: dict[str, Any],
     force = legacy_context and bool(
         status and status["status"] not in {"queued", "running"}
     )
-    if db.claim_gloss_preparation(paper_id, len(word_ids), force=force):
-        background.add_task(prepare_glosses, paper_id, word_ids)
+    if db.claim_gloss_preparation(paper_id, 0, force=force):
+        background.add_task(prepare_paper_summary, paper_id)
 
 
 @app.post("/api/papers/upload")
@@ -393,9 +326,8 @@ async def upload_paper(background: BackgroundTasks, file: UploadFile = File(...)
     parsed["chunks"] = build_chunks(parsed["sentences"], [], parsed["title"])
     paper_id = uuid.uuid4().hex
     db.create_paper(paper_id, parsed["title"], parsed)
-    word_ids = select_paper_candidates(parsed)
-    db.claim_gloss_preparation(paper_id, len(word_ids))
-    background.add_task(prepare_new_paper, paper_id, word_ids)
+    db.claim_gloss_preparation(paper_id, 0)
+    background.add_task(prepare_new_paper, paper_id)
     return {"paper_id": paper_id, "status": "processing", "cached": False}
 
 
@@ -437,7 +369,7 @@ def _gloss_preparation_response(paper_id: str) -> dict[str, Any]:
                              "failed": 0, "error": None}
     current = paper["data"].get("paper_summary")
     if preparation["status"] == "running":
-        stage = "translating" if current else "summarizing"
+        stage = "summarizing"
     else:
         stage = preparation["status"]
     return preparation | {
@@ -482,8 +414,7 @@ async def translate_word(paper_id: str, body: WordTranslationRequest,
     return await _translate_word(paper_id, body.word_id)
 
 
-async def _translate_word(paper_id: str, word_id: str,
-                          *, record_activity: bool = True) -> dict[str, Any]:
+async def _translate_word(paper_id: str, word_id: str) -> dict[str, Any]:
     paper = db.get_paper(paper_id)
     if paper is None:
         raise HTTPException(status_code=404, detail="논문을 찾을 수 없습니다.")
@@ -519,7 +450,7 @@ async def _translate_word(paper_id: str, word_id: str,
         )
 
     started = time.monotonic()
-    async with _gloss_request_lock((paper_id, word["sentence_id"])):
+    async with _gloss_request_lock((paper_id, word_id)):
         lock_wait_ms = round((time.monotonic() - started) * 1000)
         # Another click may have completed while this request waited for the local model.
         latest = db.get_paper(paper_id, touch=False)
@@ -557,10 +488,9 @@ async def _translate_word(paper_id: str, word_id: str,
         db.save_word_gloss(paper_id, word_ids, unit)
 
     elapsed_ms = round((time.monotonic() - started) * 1000)
-    if record_activity:
-        db.add_paper_activity(
-            paper_id, f"용어 뜻 생성: {unit['original']} · {elapsed_ms / 1000:.1f}초", "success",
-        )
+    db.add_paper_activity(
+        paper_id, f"용어 뜻 생성: {unit['original']} · {elapsed_ms / 1000:.1f}초", "success",
+    )
     return unit | {
         "cached": False, "elapsed_ms": elapsed_ms,
         "timing": {

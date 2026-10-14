@@ -74,7 +74,7 @@ def fail_interrupted_jobs() -> None:
         )
         db.execute(
             "UPDATE gloss_preparation SET status = 'failed', "
-            "error = '서버 재시작으로 용어 준비가 중단되었습니다.', updated_at = ? "
+            "error = '서버 재시작으로 논문 요약 준비가 중단되었습니다.', updated_at = ? "
             "WHERE status IN ('queued', 'running')",
             (time.time(),),
         )

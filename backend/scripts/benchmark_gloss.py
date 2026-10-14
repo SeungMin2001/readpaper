@@ -12,45 +12,39 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from readpaper import db  # noqa: E402
 from readpaper.config import settings  # noqa: E402
-from readpaper.llm import VLLMClient  # noqa: E402
-from readpaper.main import _word_context  # noqa: E402
+from readpaper.llm import VLLMClient, validate_keyword_gloss  # noqa: E402
 
 
 CASES = [
     {
         "label": "multiword attention",
-        "title": "Neural Sequence Models",
+        "summary": "The Transformer replaces recurrence with multi-head attention to model relationships between tokens.",
         "sentence": "Multi-head attention allows the model to attend to different representation subspaces.",
-        "focus": 1,
-        "context": "Each attention head projects queries, keys, and values separately.",
+        "clicked_token": "attention",
     },
     {
         "label": "reinforcement learning policy",
-        "title": "Learning to Act from Rewards",
+        "summary": "The paper trains a policy to maximize expected reward through reinforcement learning.",
         "sentence": "The policy is optimized to maximize expected reward.",
-        "focus": 1,
-        "context": "An agent samples actions from its policy and receives rewards.",
+        "clicked_token": "policy",
     },
     {
         "label": "attention query",
-        "title": "Attention for Sequence Modeling",
+        "summary": "The paper computes attention weights from query and key vectors in a sequence model.",
         "sentence": "Each query is compared with all keys to compute attention weights.",
-        "focus": 1,
-        "context": "Attention uses query and key vectors to calculate compatibility scores.",
+        "clicked_token": "query",
     },
     {
         "label": "positional embedding",
-        "title": "Representing Token Positions",
+        "summary": "The model adds learned position information to each input token representation.",
         "sentence": "We use a learned positional embedding for each input token.",
-        "focus": 5,
-        "context": "Position information is added to input token embeddings.",
+        "clicked_token": "embedding",
     },
     {
         "label": "residual connections",
-        "title": "Training Deep Encoders",
+        "summary": "The encoder uses skip connections around sub-layers to improve information flow.",
         "sentence": "The encoder uses residual connections around each sub-layer.",
-        "focus": 3,
-        "context": "Residual connections help gradients flow through deep layers.",
+        "clicked_token": "residual",
     },
 ]
 
@@ -66,6 +60,9 @@ def latest_paper_cases(limit: int) -> list[dict]:
 
     data = json.loads(row["data_json"])
     words = {word["id"]: word for page in data["pages"] for word in page["words"]}
+    summary = data.get("paper_summary")
+    if not summary:
+        raise SystemExit("No saved paper summary found. Upload a PDF and wait for summary preparation.")
     sentences = data["sentences"]
     by_id = {sentence["id"]: sentence for sentence in sentences}
     cases = []
@@ -79,13 +76,11 @@ def latest_paper_cases(limit: int) -> list[dict]:
         sentence = by_id[clicked["sentence_id"]]
         cases.append({
             "label": f"{gloss['original']} (saved: {gloss['meaning']})",
-            "title": row["title"],
+            "summary": summary,
             "sentence": sentence["text"],
             "tokens": [words[word_id]["text"] for word_id in sentence["word_ids"]],
             "focus": sentence["word_ids"].index(ids[0]),
-            "passages": _word_context(
-                sentences, clicked["text"], sentence["id"], data.get("chunks", []),
-            ),
+            "clicked_token": clicked["text"],
         })
         if len(cases) == limit:
             break
@@ -101,11 +96,16 @@ async def benchmark(cases: list[dict]) -> None:
         client = VLLMClient()
         sentence = case["sentence"]
         tokens = case.get("tokens") or sentence.split()
-        passages = case["passages"] if "passages" in case else [sentence, case["context"]]
+        focus = case.get("focus", next(
+            (index for index, token in enumerate(tokens)
+             if token.strip(".,;:!?()[]{}\\\"'").casefold()
+             == case["clicked_token"].strip(".,;:!?()[]{}\\\"'").casefold()), 0,
+        ))
         started = time.monotonic()
-        result = await client.translate_keyword(
-            case["title"], sentence, tokens, case["focus"], passages,
+        result = await client.translate_keyword_from_summary(
+            case["summary"], case["clicked_token"],
         )
+        result = validate_keyword_gloss(result, tokens, focus)
         wall_ms = round((time.monotonic() - started) * 1000)
         durations.append(wall_ms)
         metrics = client.last_metrics

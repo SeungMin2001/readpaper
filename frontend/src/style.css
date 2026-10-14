@@ -90,9 +90,8 @@ a { color: inherit; }
 .preparation-card h1 { margin: 0 0 12px; color: var(--green-deep); font-family: 'DM Serif Display', 'Noto Sans KR', serif; font-size: clamp(25px, 4vw, 36px); font-weight: 400; line-height: 1.35; }
 .preparation-title { margin: 0 0 32px; color: var(--muted); font-size: 12px; line-height: 1.6; }
 .preparation-progress { height: 7px; overflow: hidden; border-radius: 20px; background: #e9eee7; }
-.preparation-progress span { height: 100%; display: block; border-radius: inherit; background: #6c9271; transition: width .35s ease; }
-.preparation-count { margin: 14px 0 0; color: #6a786d; font-size: 12px; }
-.preparation-count strong { color: var(--green-deep); font-size: 17px; }
+.preparation-progress span { width: 36%; height: 100%; display: block; border-radius: inherit; background: #6c9271; animation: preparation-sweep 1.4s ease-in-out infinite alternate; }
+@keyframes preparation-sweep { from { transform: translateX(0); } to { transform: translateX(178%); } }
 .preparation-note { margin: 22px 0 0; color: #879189; font-size: 11px; line-height: 1.75; }
 .preparation-summary { margin: 22px 0 0; padding: 13px 15px; border-left: 2px solid #8ca48b; background: #f3f5ef; color: #546a57; font-size: 12px; line-height: 1.7; }
 .preparation-actions { margin-top: 25px; display: flex; flex-wrap: wrap; gap: 9px; }

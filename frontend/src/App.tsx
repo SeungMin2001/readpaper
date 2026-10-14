@@ -307,7 +307,7 @@ export default function App() {
   )
 
   const sourceCounts = countSources(paper?.sources || [])
-  const preparingGlosses = Boolean(pdf && !skipPreparation &&
+  const preparingSummary = Boolean(pdf && !skipPreparation &&
     (uploading || !paper || glossPreparation?.status !== 'completed'))
 
   return (
@@ -315,7 +315,7 @@ export default function App() {
       <header className="site-header">
         <Brand />
         <div className="header-right">
-          {paper?.status === 'ready' && !preparingGlosses && <span className="header-state"><span className="status-dot" /> 읽을 준비가 됐어요</span>}
+          {paper?.status === 'ready' && !preparingSummary && <span className="header-state"><span className="status-dot" /> 읽을 준비가 됐어요</span>}
           <span className="user-name">{user}</span>
           <button className="text-button" onClick={() => { void api.logout().then(() => { setUser(null); setPaper(null); setPaperId(null); setPdf(null); setFileName('') }) }}>로그아웃</button>
         </div>
@@ -346,23 +346,21 @@ export default function App() {
           <div className="welcome-footer"><span>READPAPER — RESEARCH, AT YOUR PACE</span><span>01 / YOUR READING SPACE</span></div>
           {notice && <div className="toast" role="status">{notice}<button onClick={() => setNotice('')} aria-label="닫기">×</button></div>}
         </main>
-      ) : preparingGlosses ? (
+      ) : preparingSummary ? (
         <main className="preparation-page" aria-live="polite">
           <div className="preparation-card">
             <p className="eyebrow">PREPARING YOUR PAPER</p>
-            <h1>{glossPreparation?.status === 'failed' ? '용어 준비가 멈췄습니다.' : glossPreparation?.stage === 'summarizing' ? '논문의 핵심을 요약하고 있어요.' : '읽기 전에 용어를 준비하고 있어요.'}</h1>
+            <h1>{glossPreparation?.status === 'failed' ? '논문 요약 준비가 멈췄습니다.' : glossPreparation?.stage === 'summarizing' ? '논문의 핵심을 요약하고 있어요.' : '읽을 준비를 하고 있어요.'}</h1>
             <p className="preparation-title">{paper?.title || fileName}</p>
-            <div className="preparation-progress" role="progressbar" aria-label="주요 용어 준비" aria-valuemin={0}
-              aria-valuemax={glossPreparation?.total || 1} aria-valuenow={glossPreparation?.ready || 0}>
-              <span style={{ width: `${glossPreparation?.total ? glossPreparation.ready / glossPreparation.total * 100 : 0}%` }} />
-            </div>
-            <p className="preparation-count"><strong>{glossPreparation?.ready || 0}</strong> / {glossPreparation?.total ?? '…'}개 주요 용어 준비됨</p>
+            {glossPreparation?.status !== 'failed' && <div className="preparation-progress" role="progressbar" aria-label="논문 요약 준비 중">
+              <span />
+            </div>}
             {glossPreparation?.summary && <p className="preparation-summary">{glossPreparation.summary}</p>}
-            <p className="preparation-note">논문을 한 문장으로 요약해 저장한 뒤, 요약과 클릭한 단어만 모델에 보내 뜻을 준비합니다. 나머지 단어는 읽다가 누르면 번역합니다.</p>
+            <p className="preparation-note">논문 내용을 한 문장으로 요약해 저장합니다. 용어 번역은 읽다가 누를 때 요약과 용어만 모델에 보냅니다.</p>
             {glossPreparation?.status === 'failed' && <div className="preparation-actions">
               <p>{glossPreparation.error || '로컬 모델 연결을 확인해 주세요.'}</p>
               <button className="primary-button" onClick={() => { void retryPreparation() }}>다시 시도</button>
-              <button className="secondary-button" onClick={() => setSkipPreparation(true)}>원문 먼저 읽기</button>
+              <button className="secondary-button" onClick={() => setSkipPreparation(true)}>요약 없이 원문 먼저 읽기</button>
             </div>}
           </div>
         </main>
@@ -393,7 +391,7 @@ export default function App() {
                   <button disabled={pageIndex + 1 >= pdf.numPages} onClick={() => setPageIndex(Math.min(pdf.numPages - 1, pageIndex + 1))} aria-label="다음 페이지">›</button>
                 </div>
               </div>
-              <p className="reader-hint">준비된 주요 용어는 누르면 바로 뜻이 보입니다. 다른 단어는 논문 문맥을 반영해 번역합니다.{glossPreparation?.failed ? <span> · {glossPreparation.failed}개 용어는 미리 준비되지 않았습니다.</span> : null}{paper?.status !== 'ready' && <span> · 문헌 검색은 계속 진행 중입니다.</span>}</p>
+              <p className="reader-hint">단어를 누르면 논문 핵심 요약을 바탕으로 뜻을 만들고 저장합니다. 같은 위치를 다시 누르면 저장된 뜻을 바로 보여줍니다.{paper?.status !== 'ready' && <span> · 문헌 검색은 계속 진행 중입니다.</span>}</p>
               <div className="pdf-stage">
                 <PdfReader
                   document={pdf} pageIndex={pageIndex} page={currentPage}

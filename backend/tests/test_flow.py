@@ -16,9 +16,8 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from readpaper import db  # noqa: E402
 from readpaper.config import Settings  # noqa: E402
-from readpaper.gloss_preparation import select_paper_candidates  # noqa: E402
 from readpaper.llm import ModelUnavailable  # noqa: E402
-from readpaper.main import _word_context, app  # noqa: E402
+from readpaper.main import app  # noqa: E402
 from readpaper.pdf import extract_pdf  # noqa: E402
 from readpaper.rag import build_chunks, retrieve  # noqa: E402
 from readpaper.sources import collect_external_sources, reconstruct_abstract  # noqa: E402
@@ -47,18 +46,28 @@ def example_pdf() -> bytes:
 
 class FakeVLLM:
     def __init__(self):
+        self.summary_calls = 0
         self.keyword_calls = 0
-        self.last_passages = []
+        self.last_summary = ""
+        self.last_summary_source = ""
+        self.last_clicked_token = ""
 
     async def select_related_papers(self, profile, candidates, limit=8):
         return candidates[:limit]
 
-    async def translate_keyword(self, title, sentence, tokens, focus_index, paper_passages):
+    async def summarize_paper(self, title, paper_text):
+        self.summary_calls += 1
+        self.last_summary_source = paper_text
+        self.last_summary = "The paper improves robotic control through policy optimization and contextual representations."
+        return self.last_summary
+
+    async def translate_keyword_from_summary(self, paper_summary, clicked_token):
         self.keyword_calls += 1
-        self.last_passages = paper_passages
-        if tokens[:2] == ["Reinforcement", "learning"] and focus_index < 2:
-            return {"start": 0, "end": 2, "meaning": "강화학습"}
-        return {"start": focus_index, "end": focus_index + 1, "meaning": "문맥상 뜻"}
+        self.last_summary = paper_summary
+        self.last_clicked_token = clicked_token
+        if clicked_token == "Reinforcement":
+            return {"term": "Reinforcement learning", "meaning": "강화학습"}
+        return {"term": clicked_token, "meaning": "문맥상 뜻"}
 
     async def search_query(self, question):
         return "robotic control"
@@ -122,13 +131,12 @@ class ReadpaperFlowTests(unittest.TestCase):
                     self.assertEqual(len(paper["sentences"]), 6)
                     self.assertEqual(paper["word_glosses"], {})
 
-    def test_major_terms_prepare_before_reading_and_click_uses_cache(self):
+    def test_only_summary_prepares_before_reading_and_terms_are_on_demand(self):
         with tempfile.TemporaryDirectory() as directory:
             config = Settings(data_dir=Path(directory), dev_mode=True)
             fake_model = FakeVLLM()
             with patch("readpaper.db.settings", config), patch("readpaper.main.settings", config), \
                     patch("readpaper.main.VLLMClient", return_value=fake_model), \
-                    patch("readpaper.main.select_paper_candidates", return_value=["w0", "w17"]), \
                     patch("readpaper.main.collect_external_sources", fake_sources):
                 with TestClient(app) as client:
                     upload = client.post(
@@ -140,45 +148,32 @@ class ReadpaperFlowTests(unittest.TestCase):
                     preparation = client.get(f"/api/papers/{paper_id}/gloss-preparation")
                     self.assertEqual(preparation.status_code, 200)
                     self.assertEqual(preparation.json()["status"], "completed")
-                    self.assertEqual(preparation.json()["total"], 2)
-                    self.assertEqual(preparation.json()["ready"], 2)
-                    self.assertEqual(fake_model.keyword_calls, 2)
-                    self.assertIn("w1", preparation.json()["word_glosses"])
-                    self.assertIn("w17", preparation.json()["word_glosses"])
+                    self.assertEqual(preparation.json()["total"], 0)
+                    self.assertEqual(preparation.json()["ready"], 0)
+                    self.assertTrue(preparation.json()["summary"])
+                    self.assertEqual(fake_model.summary_calls, 1)
+                    self.assertEqual(fake_model.keyword_calls, 0)
+                    self.assertEqual(preparation.json()["word_glosses"], {})
 
                     cached = client.post(
-                        f"/api/papers/{paper_id}/translate-word", json={"word_id": "w1"},
+                        f"/api/papers/{paper_id}/translate-word", json={"word_id": "w0"},
                     )
                     self.assertEqual(cached.status_code, 200)
-                    self.assertTrue(cached.json()["cached"])
-                    self.assertEqual(fake_model.keyword_calls, 2)
+                    self.assertFalse(cached.json()["cached"])
+                    self.assertEqual(fake_model.keyword_calls, 1)
+                    self.assertEqual(fake_model.last_summary, preparation.json()["summary"])
+                    self.assertEqual(fake_model.last_clicked_token, "Reinforcement")
                     client.post(f"/api/papers/{paper_id}/gloss-preparation")
-                    self.assertEqual(fake_model.keyword_calls, 2)
-
-    def test_major_term_selection_avoids_duplicate_requests_in_one_sentence(self):
-        parsed = extract_pdf(example_pdf())
-        selected = select_paper_candidates(parsed)
-        words = {word["id"]: word for page in parsed["pages"] for word in page["words"]}
-        self.assertEqual(len(selected), len({words[word_id]["sentence_id"] for word_id in selected}))
-        self.assertIn("w0", selected)
-
-    def test_major_term_selection_keeps_ai_acronyms(self):
-        paper = {"title": "Efficient RAG with LoRA", "pages": [{"words": [
-            {"id": "w0", "text": "RAG", "sentence_id": "s0"},
-            {"id": "w1", "text": "LoRA", "sentence_id": "s1"},
-            {"id": "w2", "text": "method", "sentence_id": "s2"},
-        ]}]}
-        self.assertEqual(set(select_paper_candidates(paper, limit=2)), {"w0", "w1"})
+                    self.assertEqual(fake_model.keyword_calls, 1)
 
     def test_gloss_preparation_can_retry_after_model_outage(self):
         class OfflineVLLM:
-            async def translate_keyword(self, *args, **kwargs):
+            async def summarize_paper(self, *args, **kwargs):
                 raise ModelUnavailable("Mac mini vLLM is offline")
 
         with tempfile.TemporaryDirectory() as directory:
             config = Settings(data_dir=Path(directory), dev_mode=True)
             with patch("readpaper.db.settings", config), patch("readpaper.main.settings", config), \
-                    patch("readpaper.main.select_paper_candidates", return_value=["w0"]), \
                     patch("readpaper.main.collect_external_sources", fake_sources):
                 with TestClient(app) as client:
                     with patch("readpaper.main.VLLMClient", OfflineVLLM):
@@ -189,7 +184,7 @@ class ReadpaperFlowTests(unittest.TestCase):
                     paper_id = upload.json()["paper_id"]
                     failed = client.get(f"/api/papers/{paper_id}/gloss-preparation").json()
                     self.assertEqual(failed["status"], "failed")
-                    self.assertEqual(failed["failed"], 1)
+                    self.assertEqual(failed["failed"], 0)
 
                     fake_model = FakeVLLM()
                     with patch("readpaper.main.VLLMClient", return_value=fake_model):
@@ -197,8 +192,9 @@ class ReadpaperFlowTests(unittest.TestCase):
                     self.assertEqual(retried.status_code, 200)
                     completed = client.get(f"/api/papers/{paper_id}/gloss-preparation").json()
                     self.assertEqual(completed["status"], "completed")
-                    self.assertEqual(completed["ready"], 1)
-                    self.assertIn("w0", completed["word_glosses"])
+                    self.assertEqual(completed["ready"], 0)
+                    self.assertTrue(completed["summary"])
+                    self.assertEqual(fake_model.keyword_calls, 0)
 
     def test_upload_keyword_gloss_rag_and_vocabulary(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -206,7 +202,6 @@ class ReadpaperFlowTests(unittest.TestCase):
             fake_model = FakeVLLM()
             with patch("readpaper.db.settings", config), patch("readpaper.main.settings", config), \
                     patch("readpaper.main.VLLMClient", return_value=fake_model), \
-                    patch("readpaper.main.select_paper_candidates", return_value=[]), \
                     patch("readpaper.main.collect_external_sources", fake_sources):
                 with TestClient(app) as client:
                     pdf_bytes = example_pdf()
@@ -221,6 +216,8 @@ class ReadpaperFlowTests(unittest.TestCase):
                     self.assertEqual(len(paper["sentences"]), 6)
                     self.assertEqual(paper["word_glosses"], {})
                     self.assertEqual(fake_model.keyword_calls, 0)
+                    summary = client.get(f"/api/papers/{paper_id}/gloss-preparation").json()["summary"]
+                    self.assertEqual(fake_model.summary_calls, 1)
 
                     gloss_response = client.post(
                         f"/api/papers/{paper_id}/translate-word", json={"word_id": "w0"},
@@ -231,9 +228,9 @@ class ReadpaperFlowTests(unittest.TestCase):
                     self.assertEqual(first_unit["meaning"], "강화학습")
                     self.assertEqual(len(first_unit["word_ids"]), 2)
                     self.assertIn("timing", first_unit)
-                    self.assertIsNotNone(first_unit["timing"]["context_ms"])
+                    self.assertEqual(first_unit["timing"]["context_ms"], 0)
                     self.assertIsNone(first_unit["timing"]["provider_request_ms"])
-                    self.assertGreaterEqual(len(fake_model.last_passages), 1)
+                    self.assertEqual(fake_model.last_summary, summary)
                     cached_gloss = client.post(
                         f"/api/papers/{paper_id}/translate-word", json={"word_id": "w1"},
                     ).json()
@@ -270,7 +267,7 @@ class ReadpaperFlowTests(unittest.TestCase):
 
     def test_discovered_sources_are_visible_if_local_model_is_unavailable(self):
         class OfflineVLLM:
-            async def translate_keyword(self, *args, **kwargs):
+            async def summarize_paper(self, *args, **kwargs):
                 raise ModelUnavailable("Mac mini vLLM is offline")
 
         with tempfile.TemporaryDirectory() as directory:
@@ -299,20 +296,6 @@ class ReadpaperFlowTests(unittest.TestCase):
                         503,
                     )
                     self.assertEqual(client.get(f"/api/papers/{paper_id}").json()["status"], "ready")
-
-    def test_word_context_uses_other_passages_from_uploaded_paper_only(self):
-        sentences = [
-            {"id": "s0", "text": "Attention selects useful features."},
-            {"id": "s1", "text": "We apply attention to token representations."},
-        ]
-        passages = _word_context(sentences, "Attention", "s0", [
-            {"kind": "paper", "text": "The model uses attention weights to focus on tokens."},
-            {"kind": "related", "text": "External attention paper unrelated to this document."},
-        ])
-
-        self.assertIn(sentences[1]["text"], passages)
-        self.assertTrue(any("attention weights" in passage for passage in passages))
-        self.assertFalse(any("External attention" in passage for passage in passages))
 
     def test_retrieval_and_abstract_reconstruction(self):
         self.assertEqual(

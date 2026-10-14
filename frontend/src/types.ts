@@ -33,7 +33,7 @@ export type WordGloss = {
 
 export type GlossPreparation = {
   status: 'pending' | 'queued' | 'running' | 'completed' | 'failed'
-  stage: 'pending' | 'queued' | 'summarizing' | 'translating' | 'completed' | 'failed'
+  stage: 'pending' | 'queued' | 'summarizing' | 'completed' | 'failed'
   total: number
   ready: number
   failed: number
