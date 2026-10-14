@@ -38,6 +38,13 @@ def init_db() -> None:
                 created_at REAL NOT NULL,
                 UNIQUE(paper_title, term, source_sentence)
             );
+            CREATE TABLE IF NOT EXISTS paper_activity (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                paper_id TEXT NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
+                created_at REAL NOT NULL,
+                state TEXT NOT NULL,
+                message TEXT NOT NULL
+            );
         """)
 
 
@@ -96,6 +103,35 @@ def set_paper(paper_id: str, *, status: str | None = None, progress: int | None 
     values.append(paper_id)
     with connect() as db:
         db.execute(f"UPDATE papers SET {', '.join(fields)} WHERE id = ?", values)
+
+
+def clear_paper_activity(paper_id: str) -> None:
+    with connect() as db:
+        db.execute("DELETE FROM paper_activity WHERE paper_id = ?", (paper_id,))
+
+
+def add_paper_activity(paper_id: str, message: str, state: str = "info") -> None:
+    with connect() as db:
+        db.execute(
+            "INSERT INTO paper_activity (paper_id, created_at, state, message) VALUES (?, ?, ?, ?)",
+            (paper_id, time.time(), state, message[:500]),
+        )
+        db.execute(
+            "DELETE FROM paper_activity WHERE paper_id = ? AND id NOT IN "
+            "(SELECT id FROM paper_activity WHERE paper_id = ? ORDER BY id DESC LIMIT 80)",
+            (paper_id, paper_id),
+        )
+
+
+def list_paper_activity(paper_id: str) -> list[dict[str, Any]]:
+    with connect() as db:
+        rows = db.execute(
+            "SELECT id, created_at, state, message FROM ("
+            "SELECT id, created_at, state, message FROM paper_activity "
+            "WHERE paper_id = ? ORDER BY id DESC LIMIT 80) ORDER BY id ASC",
+            (paper_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def find_cached_paper(content_hash: str) -> dict[str, Any] | None:

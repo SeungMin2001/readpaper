@@ -1,5 +1,6 @@
 import asyncio
 import re
+from collections.abc import Awaitable, Callable
 from datetime import date, timedelta
 from difflib import SequenceMatcher
 from typing import Any
@@ -7,6 +8,16 @@ from typing import Any
 import httpx
 
 from .config import settings
+
+
+ActivityReporter = Callable[[str, str], Awaitable[None]]
+
+
+async def _report_activity(
+    reporter: ActivityReporter | None, message: str, state: str = "info",
+) -> None:
+    if reporter:
+        await reporter(message, state)
 
 
 def reconstruct_abstract(index: Any) -> str:
@@ -102,7 +113,12 @@ def _paper_source(work: dict[str, Any], kind: str, index: int) -> dict[str, Any]
     }
 
 
-async def collect_external_sources(title: str, doi: str | None, keywords: list[str]) -> tuple[list[dict[str, Any]], list[str]]:
+async def collect_external_sources(
+    title: str,
+    doi: str | None,
+    keywords: list[str],
+    on_event: ActivityReporter | None = None,
+) -> tuple[list[dict[str, Any]], list[str]]:
     sources: list[dict[str, Any]] = []
     warnings: list[str] = []
     seen_works: set[str] = set()
@@ -126,6 +142,8 @@ async def collect_external_sources(title: str, doi: str | None, keywords: list[s
         lookup_requests.append({"search": title[:200], "per-page": 5})
         lookup_errors = []
         for params in lookup_requests:
+            lookup_kind = "DOI" if "filter" in params else "제목"
+            await _report_activity(on_event, f"OpenAlex에서 {lookup_kind}으로 업로드 논문을 찾는 중")
             try:
                 response = await client.get(
                     f"{settings.openalex_url}/works", params=_openalex_params(params)
@@ -141,8 +159,11 @@ async def collect_external_sources(title: str, doi: str | None, keywords: list[s
             ), None)
             if work:
                 break
+        if work:
+            await _report_activity(on_event, f"업로드 논문 확인: {work.get('display_name', title)}", "success")
         if not work and lookup_errors:
             warnings.append("OpenAlex에 연결할 수 없어 관련·인용 논문을 수집하지 못했습니다.")
+            await _report_activity(on_event, warnings[-1], "warning")
 
         if work:
             if isinstance(work.get("id"), str):
@@ -161,8 +182,21 @@ async def collect_external_sources(title: str, doi: str | None, keywords: list[s
                         relation_kinds[work_key] = kind
                         relation_ids.append(work_key)
 
+            reference_total = sum(kind == "referenced" for kind in relation_kinds.values())
+            related_total = sum(kind == "related" for kind in relation_kinds.values())
+            await _report_activity(
+                on_event,
+                f"참고문헌 {reference_total}개와 관련 연구 후보 {related_total}개를 확인했습니다",
+                "success",
+            )
+
             for offset in range(0, len(relation_ids), 50):
                 batch = relation_ids[offset:offset + 50]
+                batch_end = min(offset + len(batch), len(relation_ids))
+                await _report_activity(
+                    on_event,
+                    f"참고·관련 논문 서지정보 조회 중 ({offset + 1}–{batch_end}/{len(relation_ids)})",
+                )
                 try:
                     response = await client.get(f"{settings.openalex_url}/works", params=_openalex_params({
                         "filter": f"openalex_id:{'|'.join(batch)}", "per-page": len(batch),
@@ -177,10 +211,17 @@ async def collect_external_sources(title: str, doi: str | None, keywords: list[s
                         item = by_id.get(work_key)
                         if item:
                             add_work(item, relation_kinds[work_key])
+                    await _report_activity(
+                        on_event,
+                        f"참고·관련 논문 서지정보 {batch_end}/{len(relation_ids)}개 처리 완료",
+                        "success",
+                    )
                 except (httpx.HTTPError, ValueError, KeyError, TypeError):
                     warnings.append("인용·관련 논문 일부의 서지 정보를 가져오지 못했습니다.")
+                    await _report_activity(on_event, warnings[-1], "warning")
                     break
 
+            await _report_activity(on_event, "업로드 논문을 인용한 연구를 검색하는 중")
             try:
                 response = await client.get(
                     f"{settings.openalex_url}/works",
@@ -189,12 +230,19 @@ async def collect_external_sources(title: str, doi: str | None, keywords: list[s
                     }),
                 )
                 response.raise_for_status()
+                citing_before = sum(source["kind"] == "citing" for source in sources)
                 for item in response.json().get("results", []):
                     add_work(item, "citing")
+                citing_count = sum(source["kind"] == "citing" for source in sources) - citing_before
+                await _report_activity(
+                    on_event, f"피인용 논문 {citing_count}편의 서지정보를 확인했습니다", "success",
+                )
             except (httpx.HTTPError, ValueError, KeyError):
                 warnings.append("이 논문을 인용한 연구 일부를 가져오지 못했습니다.")
+                await _report_activity(on_event, warnings[-1], "warning")
         elif not warnings:
             warnings.append("OpenAlex에서 업로드 논문을 찾지 못해 참고·인용 관계를 확인하지 못했습니다.")
+            await _report_activity(on_event, warnings[-1], "warning")
 
         if keywords:
             today = date.today().isoformat()

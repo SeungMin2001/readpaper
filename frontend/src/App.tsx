@@ -4,7 +4,7 @@ import type { PDFDocumentProxy } from 'pdfjs-dist'
 import { api } from './api'
 import CitationGraph from './CitationGraph'
 import PdfReader from './PdfReader'
-import type { Answer, Paper, Source, TranslationUnit, VocabularyItem, Word } from './types'
+import type { ActivityEvent, Answer, Paper, Source, TranslationUnit, VocabularyItem, Word } from './types'
 
 pdfjs.GlobalWorkerOptions.workerSrc = new URL('pdfjs-dist/build/pdf.worker.mjs', import.meta.url).toString()
 
@@ -359,6 +359,7 @@ function countSources(sources: Source[]) {
 
 function AnalysisTimeline({ paper, paperId, uploading, onRetry }: { paper: Paper | null; paperId: string | null; uploading: boolean; onRetry: () => void }) {
   const status = paper?.status
+  const activity = paper?.activity || []
   const sourcesReady = Boolean(paper?.sources_ready)
   const completedSteps = status === 'ready' ? 3 : sourcesReady ? 2 : paperId ? 1 : 0
   const steps = ['논문 구조 읽기', '인용·관련 연구 찾기', '문장별 번역 준비']
@@ -373,7 +374,22 @@ function AnalysisTimeline({ paper, paperId, uploading, onRetry }: { paper: Paper
       const active = status !== 'failed' && index === completedSteps
       return <div className={`timeline-step ${complete ? 'complete' : ''} ${active ? 'active' : ''} ${failed ? 'failed' : ''}`} key={label}><span className="timeline-step-marker">{complete ? <Icon name="check" size={13} /> : failed ? '!' : String(index + 1).padStart(2, '0')}</span><div className="timeline-step-copy"><strong>{label}</strong><span>{index === 0 ? '제목과 문장 구조' : index === 1 ? 'OpenAlex 관계 정보' : '원문 문맥을 반영'}</span></div></div>
     })}</div>
+    {(paperId || uploading) && <ActivityLog activity={activity} live={uploading || status === 'processing'} />}
     {status === 'failed' && paperId && <button className="retry-button" onClick={onRetry}>다시 시도</button>}
+  </section>
+}
+
+function ActivityLog({ activity, live }: { activity: ActivityEvent[]; live: boolean }) {
+  const entries = [...activity].reverse()
+  return <section className="timeline-activity" aria-label="실시간 분석 로그">
+    <header className="timeline-activity-heading"><div><span className="eyebrow">LIVE PROCESS LOG</span><strong>수집·분석 로그</strong></div><span className={`activity-live ${live ? 'activity-live--on' : ''}`}><i />{live ? 'LIVE' : '기록'}</span></header>
+    <div className="timeline-activity-list" role="log" aria-live="polite" aria-relevant="additions">
+      {entries.length > 0 ? entries.map((event) => <div className={`activity-entry activity-entry--${event.state}`} key={event.id}>
+        <time dateTime={new Date(event.created_at * 1000).toISOString()}>{new Date(event.created_at * 1000).toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false })}</time>
+        <i aria-hidden="true" />
+        <span>{event.message}</span>
+      </div>) : <p className="activity-empty">PDF를 읽고 있습니다. 첫 처리 로그를 기다리는 중입니다.</p>}
+    </div>
   </section>
 }
 

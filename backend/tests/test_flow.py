@@ -67,7 +67,9 @@ class FakeOllama:
         return {"answer": "근거에 따르면 로봇 제어를 개선합니다.", "citations": [contexts[0]["id"]]}
 
 
-async def fake_sources(title, doi, keywords):
+async def fake_sources(title, doi, keywords, on_event=None):
+    if on_event:
+        await on_event("OpenAlex에서 관련 연구 후보를 확인했습니다", "success")
     return [{
         "id": "external-0", "kind": "related", "title": "A related study",
         "text": "Robotic control with reinforcement learning.",
@@ -174,6 +176,11 @@ class ReadpaperFlowTests(unittest.TestCase):
                     self.assertEqual(paper["status"], "failed")
                     self.assertTrue(paper["sources_ready"])
                     self.assertEqual([source["title"] for source in paper["sources"]], ["A related study"])
+                    self.assertIn(
+                        "OpenAlex에서 관련 연구 후보를 확인했습니다",
+                        [event["message"] for event in paper["activity"]],
+                    )
+                    self.assertEqual(paper["activity"][-1]["state"], "error")
 
     def test_invalid_gloss_alignment_rejected(self):
         with self.assertRaises(InvalidModelOutput):
@@ -239,16 +246,23 @@ class ReadpaperFlowTests(unittest.TestCase):
 
         client_class = httpx.AsyncClient
         transport = httpx.MockTransport(respond)
+        activity = []
+
+        async def collect_event(message, state):
+            activity.append((message, state))
+
         with patch("readpaper.sources.httpx.AsyncClient", side_effect=lambda **kwargs: client_class(
             transport=transport, **kwargs,
         )):
             sources, warnings = asyncio.run(collect_external_sources(
-                "A Paper With Nine References", None, [],
+                "A Paper With Nine References", None, [], on_event=collect_event,
             ))
 
         self.assertEqual(len(sources), 9)
         self.assertTrue(all(source["kind"] == "referenced" for source in sources))
         self.assertFalse(warnings)
+        self.assertTrue(any("참고문헌 9개" in message for message, _state in activity))
+        self.assertTrue(any("서지정보 9/9개 처리 완료" in message for message, _state in activity))
 
     def test_external_sources_are_labeled_and_title_matched(self):
         def work(work_id, title):
