@@ -21,6 +21,9 @@ from .sources import collect_external_sources
 
 app = FastAPI(title="Readpaper API", version="0.1.0")
 
+TRANSLATION_BATCH_SIZE = 3
+TRANSLATION_BATCH_MAX_WORDS = 96
+
 
 class LoginRequest(BaseModel):
     username: str
@@ -73,6 +76,28 @@ def require_user(request: Request) -> str:
     if not _session_valid(request.cookies.get("readpaper_session")):
         raise HTTPException(status_code=401, detail="로그인이 필요합니다.")
     return settings.username
+
+
+def _translation_batches(sentences: list[dict[str, Any]], words: dict[str, dict[str, Any]]):
+    batch: list[tuple[int, dict[str, Any], list[str]]] = []
+    batch_words = 0
+    for index, sentence in enumerate(sentences):
+        tokens = [words[word_id]["text"] for word_id in sentence["word_ids"]]
+        if batch and (
+            len(batch) >= TRANSLATION_BATCH_SIZE
+            or batch_words + len(tokens) > TRANSLATION_BATCH_MAX_WORDS
+        ):
+            yield batch
+            batch = []
+            batch_words = 0
+        batch.append((index, sentence, tokens))
+        batch_words += len(tokens)
+        if batch_words >= TRANSLATION_BATCH_MAX_WORDS:
+            yield batch
+            batch = []
+            batch_words = 0
+    if batch:
+        yield batch
 
 
 _cleanup_task: asyncio.Task[None] | None = None
@@ -197,29 +222,42 @@ async def process_paper(paper_id: str) -> None:
         translations: dict[str, Any] = {}
         sentences = payload["sentences"]
         db.add_paper_activity(paper_id, f"문장 번역 시작: {len(sentences)}문장")
-        for index, sentence in enumerate(sentences):
-            tokens = [words[word_id]["text"] for word_id in sentence["word_ids"]]
-            result = await model.translate_sentence(
-                sentence, tokens, profile,
-                sentences[index - 1]["text"] if index else "",
-                sentences[index + 1]["text"] if index + 1 < len(sentences) else "",
-            )
-            units = []
-            for unit in result["units"]:
-                unit_word_ids = sentence["word_ids"][unit["start"]:unit["end"]]
-                units.append({
-                    "word_ids": unit_word_ids,
-                    "original": " ".join(words[word_id]["text"] for word_id in unit_word_ids),
-                    "meaning": unit["meaning"],
+        translated_count = 0
+        for batch in _translation_batches(sentences, words):
+            batch_started = time.monotonic()
+            requests = []
+            for index, sentence, tokens in batch:
+                requests.append({
+                    "id": sentence["id"], "sentence": sentence["text"], "tokens": tokens,
+                    "previous_sentence": sentences[index - 1]["text"] if index else "",
+                    "following_sentence": (
+                        sentences[index + 1]["text"] if index + 1 < len(sentences) else ""
+                    ),
                 })
-            translations[sentence["id"]] = {
-                "translation": result["translation"], "units": units,
-            }
-            if (index + 1) % 3 == 0 or index + 1 == len(sentences):
-                db.set_paper(paper_id, progress=18 + int(80 * (index + 1) / len(sentences)))
-                db.add_paper_activity(
-                    paper_id, f"문장 번역 진행: {index + 1}/{len(sentences)}",
-                )
+            results = await model.translate_sentences(requests, profile)
+            for _index, sentence, _tokens in batch:
+                result = results[sentence["id"]]
+                units = []
+                for unit in result["units"]:
+                    unit_word_ids = sentence["word_ids"][unit["start"]:unit["end"]]
+                    units.append({
+                        "word_ids": unit_word_ids,
+                        "original": " ".join(words[word_id]["text"] for word_id in unit_word_ids),
+                        "meaning": unit["meaning"],
+                    })
+                translations[sentence["id"]] = {
+                    "translation": result["translation"], "units": units,
+                }
+            translated_count += len(batch)
+            elapsed = time.monotonic() - batch_started
+            db.set_paper(
+                paper_id, progress=18 + int(80 * translated_count / len(sentences)),
+            )
+            db.add_paper_activity(
+                paper_id,
+                f"문장 번역 진행: {translated_count}/{len(sentences)} · 묶음 {len(batch)}문장 "
+                f"{elapsed:.1f}초",
+            )
 
         payload["translations"] = translations
         payload["chunks"] = build_chunks(sentences, external, payload["title"])

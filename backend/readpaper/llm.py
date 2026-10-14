@@ -80,48 +80,80 @@ class OllamaClient:
         self, sentence: dict[str, Any], tokens: list[str], profile: dict[str, Any],
         previous: str, following: str,
     ) -> dict[str, Any]:
-        if not tokens:
-            raise InvalidModelOutput(f"문장 {sentence['id']}에서 번역할 단어를 찾지 못했습니다.")
+        request = {
+            "id": sentence["id"], "sentence": sentence["text"], "tokens": tokens,
+            "previous_sentence": previous, "following_sentence": following,
+        }
+        return (await self.translate_sentences([request], profile))[sentence["id"]]
+
+    async def translate_sentences(
+        self, sentences: list[dict[str, Any]], profile: dict[str, Any],
+    ) -> dict[str, dict[str, Any]]:
+        if not sentences:
+            return {}
+        ids = [sentence["id"] for sentence in sentences]
+        if len(ids) != len(set(ids)):
+            raise InvalidModelOutput("번역 요청에 중복된 문장 ID가 있습니다.")
+        for sentence in sentences:
+            if not sentence.get("tokens"):
+                raise InvalidModelOutput(f"문장 {sentence['id']}에서 번역할 단어를 찾지 못했습니다.")
+
         request = {
             "paper_summary": profile["summary"],
-            "previous_sentence": previous,
-            "sentence_id": sentence["id"],
-            "sentence": sentence["text"],
-            "following_sentence": following,
-            "tokens": [{"index": i, "text": token} for i, token in enumerate(tokens)],
+            "sentences": {
+                sentence["id"]: {
+                    "previous_sentence": sentence.get("previous_sentence", ""),
+                    "sentence": sentence["sentence"],
+                    "following_sentence": sentence.get("following_sentence", ""),
+                    "tokens": [
+                        {"index": index, "text": token}
+                        for index, token in enumerate(sentence["tokens"])
+                    ],
+                }
+                for sentence in sentences
+            },
         }
         system = (
-            "You translate English AI research papers into Korean. Return ONLY JSON: "
-            '{"translation":"natural Korean sentence","token_glosses":[{"join_previous":false,"meaning":"short Korean gloss"}]}. '
-            f"Return exactly {len(tokens)} token_glosses, one for each supplied token, in the same order. "
-            "Do not omit or combine entries. Set join_previous=true only when this token belongs to "
-            "a multiword term with the preceding token; otherwise set false. The first token must set "
-            "join_previous=false. For all tokens in one multiword term, repeat the same contextual Korean "
-            "gloss (e.g. both tokens in reinforcement learning use 강화학습). Use one token per unit except "
-            "multiword technical terms. Keep names, numbers and equation tokens unchanged if translation "
-            "is inappropriate. Use the paper summary and neighboring sentences to resolve domain-specific "
-            "meanings. Provide one best short gloss per token; no definitions or alternatives."
+            "Translate English AI research paper sentences into Korean using the paper context. "
+            "Return ONLY a JSON object whose top-level keys are exactly the supplied sentence IDs. "
+            "For each sentence ID, return translation and token_glosses. For that sentence, return "
+            "exactly one token_glosses entry per input token, in the same order; do not omit or combine entries. "
+            "Each entry has join_previous (boolean) and meaning (short Korean gloss). Set join_previous=true "
+            "only when this token belongs to a multiword term with the preceding token; otherwise false. "
+            "The first token of each sentence must set join_previous=false. Repeat the same Korean gloss "
+            "for all tokens in a multiword term (e.g. reinforcement learning => 강화학습). Keep names, "
+            "numbers, and equation tokens unchanged when translation is inappropriate. Use neighboring "
+            "sentences and the paper summary to resolve domain-specific meanings."
         )
-        schema = {
-            "type": "object",
-            "properties": {
-                "translation": {"type": "string"},
-                "token_glosses": {
-                    "type": "array",
-                    "minItems": len(tokens),
-                    "maxItems": len(tokens),
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "join_previous": {"type": "boolean"},
-                            "meaning": {"type": "string"},
+        sentence_schemas = {}
+        for sentence in sentences:
+            token_count = len(sentence["tokens"])
+            sentence_schemas[sentence["id"]] = {
+                "type": "object",
+                "properties": {
+                    "translation": {"type": "string"},
+                    "token_glosses": {
+                        "type": "array",
+                        "minItems": token_count,
+                        "maxItems": token_count,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "join_previous": {"type": "boolean"},
+                                "meaning": {"type": "string"},
+                            },
+                            "required": ["join_previous", "meaning"],
+                            "additionalProperties": False,
                         },
-                        "required": ["join_previous", "meaning"],
-                        "additionalProperties": False,
                     },
                 },
-            },
-            "required": ["translation", "token_glosses"],
+                "required": ["translation", "token_glosses"],
+                "additionalProperties": False,
+            }
+        schema = {
+            "type": "object",
+            "properties": sentence_schemas,
+            "required": ids,
             "additionalProperties": False,
         }
         last_error: Exception | None = None
@@ -129,17 +161,32 @@ class OllamaClient:
             user = json.dumps(request, ensure_ascii=False)
             if last_error:
                 user += (
-                    f"\nYour previous response failed validation: {last_error}. "
-                    f"Rewrite the complete JSON with exactly {len(tokens)} token_glosses, "
-                    "one entry per input token, in the original order."
+                    f"\nYour previous response failed validation: {last_error}\n"
+                    "Rewrite the complete JSON for every supplied sentence ID, with exactly "
+                    "one token_glosses entry per input token."
                 )
             try:
                 result = await self.chat_json(system, user, schema=schema)
-                return validate_token_translation(result, len(tokens))
+                if set(result) != set(ids):
+                    raise InvalidModelOutput(
+                        f"번역 문장 ID가 맞지 않습니다 (기대={ids}, 받은={sorted(result)})."
+                    )
+                return {
+                    sentence["id"]: validate_token_translation(
+                        result[sentence["id"]], len(sentence["tokens"]),
+                    )
+                    for sentence in sentences
+                }
             except InvalidModelOutput as exc:
                 last_error = exc
+        if len(sentences) > 1:
+            # A malformed batch should not prevent otherwise valid sentences from being used.
+            individual_results = {}
+            for sentence in sentences:
+                individual_results.update(await self.translate_sentences([sentence], profile))
+            return individual_results
         raise InvalidModelOutput(
-            f"문장 {sentence['id']}의 단어 번역을 검증할 수 없습니다: {last_error}"
+            f"문장 {ids[0]}의 단어 번역을 검증할 수 없습니다: {last_error}"
         )
 
     async def search_query(self, korean_question: str) -> str:

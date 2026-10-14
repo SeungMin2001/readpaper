@@ -45,6 +45,9 @@ def example_pdf() -> bytes:
 
 
 class FakeOllama:
+    def __init__(self):
+        self.translation_batch_calls = 0
+
     async def profile(self, title, full_text):
         return {"summary": "로봇 제어와 언어 분석 연구", "keywords": ["reinforcement learning"]}
 
@@ -59,6 +62,17 @@ class FakeOllama:
             units.append({"start": index, "end": end, "meaning": "강화학습" if end == 2 and index == 0 else "뜻"})
             index = end
         return validate_translation({"translation": "문맥에 맞는 문장 번역", "units": units}, len(tokens))
+
+    async def translate_sentences(self, requests, profile):
+        self.translation_batch_calls += 1
+        results = {}
+        for request in requests:
+            sentence = {"id": request["id"], "text": request["sentence"]}
+            results[request["id"]] = await self.translate_sentence(
+                sentence, request["tokens"], profile,
+                request["previous_sentence"], request["following_sentence"],
+            )
+        return results
 
     async def search_query(self, question):
         return "robotic control"
@@ -109,8 +123,9 @@ class ReadpaperFlowTests(unittest.TestCase):
     def test_upload_translation_rag_and_vocabulary(self):
         with tempfile.TemporaryDirectory() as directory:
             config = Settings(data_dir=Path(directory), dev_mode=True)
+            fake_model = FakeOllama()
             with patch("readpaper.db.settings", config), patch("readpaper.main.settings", config), \
-                    patch("readpaper.main.OllamaClient", FakeOllama), \
+                    patch("readpaper.main.OllamaClient", return_value=fake_model), \
                     patch("readpaper.main.collect_external_sources", fake_sources):
                 with TestClient(app) as client:
                     pdf_bytes = example_pdf()
@@ -123,6 +138,7 @@ class ReadpaperFlowTests(unittest.TestCase):
                     paper = client.get(f"/api/papers/{paper_id}").json()
                     self.assertEqual(paper["status"], "ready")
                     self.assertEqual(len(paper["translations"]), 6)
+                    self.assertEqual(fake_model.translation_batch_calls, 2)
                     first_unit = paper["translations"]["s0"]["units"][0]
                     self.assertEqual(first_unit["original"], "Reinforcement learning")
                     self.assertEqual(first_unit["meaning"], "강화학습")
