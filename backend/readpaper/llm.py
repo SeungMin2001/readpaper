@@ -29,7 +29,9 @@ def _parse_json(content: str) -> dict[str, Any]:
 
 
 class OllamaClient:
-    async def chat_json(self, system: str, user: str) -> dict[str, Any]:
+    async def chat_json(
+        self, system: str, user: str, *, schema: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(240.0, connect=10.0)) as client:
                 response = await client.post(
@@ -37,7 +39,7 @@ class OllamaClient:
                     json={
                         "model": settings.ollama_model,
                         "stream": False,
-                        "format": "json",
+                        "format": schema or "json",
                         "think": False,
                         "options": {"temperature": 0, "num_ctx": 8192},
                         "messages": [
@@ -78,6 +80,8 @@ class OllamaClient:
         self, sentence: dict[str, Any], tokens: list[str], profile: dict[str, Any],
         previous: str, following: str,
     ) -> dict[str, Any]:
+        if not tokens:
+            raise InvalidModelOutput(f"문장 {sentence['id']}에서 번역할 단어를 찾지 못했습니다.")
         request = {
             "paper_summary": profile["summary"],
             "previous_sentence": previous,
@@ -88,22 +92,50 @@ class OllamaClient:
         }
         system = (
             "You translate English AI research papers into Korean. Return ONLY JSON: "
-            '{"translation":"natural Korean sentence","units":[{"start":0,"end":1,"meaning":"short Korean gloss"}]}. '
-            "Token indices are zero-based; end is exclusive. Units must form an exact, ordered, "
-            "non-overlapping partition of every input token. Use one token per unit except multiword "
-            "technical terms (e.g. reinforcement learning) which must be one unit. Provide the single "
-            "best contextual Korean gloss, not definitions or alternatives. Keep names, numbers and "
-            "equation tokens unchanged if translation is inappropriate. Use the paper summary and "
-            "neighboring sentences to resolve domain-specific meanings. Never omit tokens."
+            '{"translation":"natural Korean sentence","token_glosses":[{"join_previous":false,"meaning":"short Korean gloss"}]}. '
+            f"Return exactly {len(tokens)} token_glosses, one for each supplied token, in the same order. "
+            "Do not omit or combine entries. Set join_previous=true only when this token belongs to "
+            "a multiword term with the preceding token; otherwise set false. The first token must set "
+            "join_previous=false. For all tokens in one multiword term, repeat the same contextual Korean "
+            "gloss (e.g. both tokens in reinforcement learning use 강화학습). Use one token per unit except "
+            "multiword technical terms. Keep names, numbers and equation tokens unchanged if translation "
+            "is inappropriate. Use the paper summary and neighboring sentences to resolve domain-specific "
+            "meanings. Provide one best short gloss per token; no definitions or alternatives."
         )
+        schema = {
+            "type": "object",
+            "properties": {
+                "translation": {"type": "string"},
+                "token_glosses": {
+                    "type": "array",
+                    "minItems": len(tokens),
+                    "maxItems": len(tokens),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "join_previous": {"type": "boolean"},
+                            "meaning": {"type": "string"},
+                        },
+                        "required": ["join_previous", "meaning"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "required": ["translation", "token_glosses"],
+            "additionalProperties": False,
+        }
         last_error: Exception | None = None
         for attempt in range(2):
             user = json.dumps(request, ensure_ascii=False)
-            if attempt:
-                user += "\nPrevious response failed validation. Return a complete exact partition."
+            if last_error:
+                user += (
+                    f"\nYour previous response failed validation: {last_error}. "
+                    f"Rewrite the complete JSON with exactly {len(tokens)} token_glosses, "
+                    "one entry per input token, in the original order."
+                )
             try:
-                result = await self.chat_json(system, user)
-                return validate_translation(result, len(tokens))
+                result = await self.chat_json(system, user, schema=schema)
+                return validate_token_translation(result, len(tokens))
             except InvalidModelOutput as exc:
                 last_error = exc
         raise InvalidModelOutput(
@@ -183,7 +215,10 @@ def validate_translation(result: dict[str, Any], token_count: int) -> dict[str, 
             raise InvalidModelOutput("단어 번역 항목이 객체가 아닙니다.")
         start, end, meaning = unit.get("start"), unit.get("end"), unit.get("meaning")
         if type(start) is not int or type(end) is not int or start != cursor or end <= start or end > token_count:
-            raise InvalidModelOutput("단어 번역 범위가 누락되거나 겹칩니다.")
+            raise InvalidModelOutput(
+                "단어 번역 범위가 올바르지 않습니다 "
+                f"(기대 시작={cursor}, 받은 시작={start!r}, 끝={end!r}, 전체 토큰={token_count})."
+            )
         if not isinstance(meaning, str) or not meaning.strip() or len(meaning) > 100:
             raise InvalidModelOutput("단어 뜻이 없거나 너무 깁니다.")
         clean_units.append({"start": start, "end": end, "meaning": meaning.strip()})
@@ -191,6 +226,43 @@ def validate_translation(result: dict[str, Any], token_count: int) -> dict[str, 
     if cursor != token_count:
         raise InvalidModelOutput("마지막 단어까지 번역되지 않았습니다.")
     return {"translation": translation.strip(), "units": clean_units}
+
+
+def validate_token_translation(result: dict[str, Any], token_count: int) -> dict[str, Any]:
+    translation = result.get("translation")
+    glosses = result.get("token_glosses")
+    if not isinstance(translation, str) or not translation.strip():
+        raise InvalidModelOutput("문장 번역이 없습니다.")
+    if not isinstance(glosses, list) or len(glosses) != token_count:
+        actual_count = len(glosses) if isinstance(glosses, list) else "없음"
+        raise InvalidModelOutput(
+            f"단어 뜻 개수가 맞지 않습니다 (기대={token_count}, 받은={actual_count})."
+        )
+
+    units: list[dict[str, Any]] = []
+    unit_start = 0
+    unit_meaning = ""
+    for index, gloss in enumerate(glosses):
+        if not isinstance(gloss, dict):
+            raise InvalidModelOutput(f"{index + 1}번째 단어 뜻 형식이 올바르지 않습니다.")
+        join_previous = gloss.get("join_previous")
+        meaning = gloss.get("meaning")
+        if type(join_previous) is not bool:
+            raise InvalidModelOutput(f"{index + 1}번째 단어의 복합어 표시가 올바르지 않습니다.")
+        if not isinstance(meaning, str) or not meaning.strip() or len(meaning) > 100:
+            raise InvalidModelOutput(f"{index + 1}번째 단어 뜻이 없거나 너무 깁니다.")
+        meaning = meaning.strip()
+
+        # A phrase is grouped only when its tokens carry the same contextual gloss.
+        # If the model marks a join but returns different glosses, keep both tokens separate.
+        should_join = index > 0 and join_previous and meaning == unit_meaning
+        if index == 0 or not should_join:
+            if index:
+                units.append({"start": unit_start, "end": index, "meaning": unit_meaning})
+            unit_start = index
+            unit_meaning = meaning
+    units.append({"start": unit_start, "end": token_count, "meaning": unit_meaning})
+    return {"translation": translation.strip(), "units": units}
 
 
 def validate_related_selection(
