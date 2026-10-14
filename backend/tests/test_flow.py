@@ -16,7 +16,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from readpaper import db  # noqa: E402
 from readpaper.config import Settings  # noqa: E402
-from readpaper.llm import InvalidModelOutput, validate_translation  # noqa: E402
+from readpaper.llm import InvalidModelOutput, ModelUnavailable, validate_translation  # noqa: E402
 from readpaper.main import app  # noqa: E402
 from readpaper.pdf import extract_pdf  # noqa: E402
 from readpaper.rag import build_chunks, retrieve  # noqa: E402
@@ -48,6 +48,9 @@ class FakeOllama:
     async def profile(self, title, full_text):
         return {"summary": "로봇 제어와 언어 분석 연구", "keywords": ["reinforcement learning"]}
 
+    async def select_related_papers(self, profile, candidates, limit=8):
+        return candidates[:limit]
+
     async def translate_sentence(self, sentence, tokens, profile, previous, following):
         units = []
         index = 0
@@ -64,7 +67,9 @@ class FakeOllama:
         return {"answer": "근거에 따르면 로봇 제어를 개선합니다.", "citations": [contexts[0]["id"]]}
 
 
-async def fake_sources(title, doi, keywords):
+async def fake_sources(title, doi, keywords, on_event=None):
+    if on_event:
+        await on_event("OpenAlex에서 관련 연구 후보를 확인했습니다", "success")
     return [{
         "id": "external-0", "kind": "related", "title": "A related study",
         "text": "Robotic control with reinforcement learning.",
@@ -150,6 +155,33 @@ class ReadpaperFlowTests(unittest.TestCase):
                     self.assertEqual(client.get(f"/api/papers/{paper_id}").status_code, 404)
                     self.assertEqual(len(client.get("/api/vocabulary").json()), 1)
 
+    def test_discovered_sources_are_visible_if_local_model_is_unavailable(self):
+        class OfflineOllama:
+            async def profile(self, title, full_text):
+                raise ModelUnavailable("Mac mini Ollama is offline")
+
+        with tempfile.TemporaryDirectory() as directory:
+            config = Settings(data_dir=Path(directory), dev_mode=True)
+            with patch("readpaper.db.settings", config), patch("readpaper.main.settings", config), \
+                    patch("readpaper.main.OllamaClient", OfflineOllama), \
+                    patch("readpaper.main.collect_external_sources", fake_sources):
+                with TestClient(app) as client:
+                    upload = client.post(
+                        "/api/papers/upload",
+                        files={"file": ("sample.pdf", example_pdf(), "application/pdf")},
+                    )
+                    self.assertEqual(upload.status_code, 200, upload.text)
+
+                    paper = client.get(f"/api/papers/{upload.json()['paper_id']}").json()
+                    self.assertEqual(paper["status"], "failed")
+                    self.assertTrue(paper["sources_ready"])
+                    self.assertEqual([source["title"] for source in paper["sources"]], ["A related study"])
+                    self.assertIn(
+                        "OpenAlex에서 관련 연구 후보를 확인했습니다",
+                        [event["message"] for event in paper["activity"]],
+                    )
+                    self.assertEqual(paper["activity"][-1]["state"], "error")
+
     def test_invalid_gloss_alignment_rejected(self):
         with self.assertRaises(InvalidModelOutput):
             validate_translation({
@@ -214,16 +246,23 @@ class ReadpaperFlowTests(unittest.TestCase):
 
         client_class = httpx.AsyncClient
         transport = httpx.MockTransport(respond)
+        activity = []
+
+        async def collect_event(message, state):
+            activity.append((message, state))
+
         with patch("readpaper.sources.httpx.AsyncClient", side_effect=lambda **kwargs: client_class(
             transport=transport, **kwargs,
         )):
             sources, warnings = asyncio.run(collect_external_sources(
-                "A Paper With Nine References", None, [],
+                "A Paper With Nine References", None, [], on_event=collect_event,
             ))
 
         self.assertEqual(len(sources), 9)
         self.assertTrue(all(source["kind"] == "referenced" for source in sources))
         self.assertFalse(warnings)
+        self.assertTrue(any("참고문헌 9개" in message for message, _state in activity))
+        self.assertTrue(any("서지정보 9/9개 처리 완료" in message for message, _state in activity))
 
     def test_external_sources_are_labeled_and_title_matched(self):
         def work(work_id, title):
@@ -282,6 +321,45 @@ class ReadpaperFlowTests(unittest.TestCase):
         self.assertFalse(warnings)
         self.assertFalse(any(item["kind"] != "background" for item in unrelated))
         self.assertTrue(unrelated_warnings)
+
+    def test_mismatched_doi_metadata_falls_back_to_a_title_match(self):
+        def work(work_id, title):
+            return {
+                "id": f"https://openalex.org/{work_id}", "display_name": title,
+                "abstract_inverted_index": {}, "authorships": [], "doi": None,
+            }
+
+        def respond(request):
+            params = request.url.params
+            relation_filter = params.get("filter", "")
+            if relation_filter.startswith("doi:"):
+                return httpx.Response(200, json={"results": [{
+                    **work("W1", "A Completely Different Paper"),
+                    "referenced_works": [], "related_works": [],
+                }]})
+            if "search" in params:
+                return httpx.Response(200, json={"results": [{
+                    **work("W100", "Correct Root Paper"),
+                    "referenced_works": ["https://openalex.org/W2"],
+                    "related_works": [],
+                }]})
+            if relation_filter.startswith("openalex_id:"):
+                return httpx.Response(200, json={"results": [work("W2", "A Cited Paper")]})
+            return httpx.Response(200, json={"results": []})
+
+        client_class = httpx.AsyncClient
+        transport = httpx.MockTransport(respond)
+        with patch("readpaper.sources.httpx.AsyncClient", side_effect=lambda **kwargs: client_class(
+            transport=transport, **kwargs,
+        )):
+            sources, warnings = asyncio.run(collect_external_sources(
+                "Correct Root Paper", "10.1234/wrong", [],
+            ))
+
+        self.assertEqual([(item["kind"], item["title"]) for item in sources], [
+            ("referenced", "A Cited Paper"),
+        ])
+        self.assertFalse(warnings)
 
 
 if __name__ == "__main__":

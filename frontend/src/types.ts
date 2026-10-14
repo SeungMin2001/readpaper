@@ -49,20 +49,6 @@ export type Source = {
   excerpt?: string
 }
 
-export type Paper = {
-  id: string
-  title: string
-  status: 'processing' | 'ready' | 'failed'
-  progress: number
-  error: string | null
-  pages?: PaperPage[]
-  sentences?: Sentence[]
-  translations?: Record<string, SentenceTranslation>
-  profile?: { summary: string; keywords: string[] }
-  sources?: Source[]
-  source_warnings?: string[]
-}
-
 export type VocabularyItem = {
   id: number
   paper_title: string
@@ -76,4 +62,27 @@ export type Answer = {
   answer: string
   citations: string[]
   sources: Source[]
+}
+
+export type ActivityEvent = {
+  id: number
+  created_at: number
+  state: 'info' | 'success' | 'warning' | 'error'
+  message: string
+}
+
+export type Paper = {
+  id: string
+  title: string
+  status: 'processing' | 'ready' | 'failed'
+  progress: number
+  error: string | null
+  pages?: PaperPage[]
+  sentences?: Sentence[]
+  translations?: Record<string, SentenceTranslation>
+  profile?: { summary: string; keywords: string[] }
+  sources_ready?: boolean
+  sources?: Source[]
+  source_warnings?: string[]
+  activity?: ActivityEvent[]
 }

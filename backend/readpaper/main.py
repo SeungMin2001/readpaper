@@ -144,21 +144,59 @@ async def process_paper(paper_id: str) -> None:
         return
     payload = paper["data"]
     try:
-        model = OllamaClient()
+        db.clear_paper_activity(paper_id)
         db.set_paper(paper_id, status="processing", progress=3, error="")
-        profile = await model.profile(payload["title"], payload["full_text"])
-        payload["profile"] = profile
-        db.set_paper(paper_id, progress=8)
-        external, warnings = await collect_external_sources(
-            payload["title"], payload.get("doi"), profile["keywords"]
+        db.add_paper_activity(
+            paper_id,
+            f"PDF 읽기 완료: {len(payload['pages'])}페이지, {len(payload['sentences'])}문장",
+            "success",
         )
+
+        async def report_collection_event(message: str, state: str = "info") -> None:
+            db.add_paper_activity(paper_id, message, state)
+
+        # Citation and related-work discovery is metadata work; make it available
+        # before relying on Ollama for profiling or translation.
+        external, warnings = await collect_external_sources(
+            payload["title"], payload.get("doi"), [], on_event=report_collection_event,
+        )
+        # OpenAlex returns related_works ordered by its own relevance signal.
+        # Use the first eight as an explicit, non-LLM baseline for this stage.
+        related_count = 0
+        discovered = []
+        for source in external:
+            if source.get("kind") == "related":
+                if related_count >= 8:
+                    continue
+                related_count += 1
+            discovered.append(source)
+        external = discovered
         payload["external_sources"] = external
         payload["source_warnings"] = warnings
-        db.set_paper(paper_id, progress=12)
+        db.set_paper(paper_id, progress=12, payload=payload)
+        source_counts = {
+            kind: sum(source.get("kind") == kind for source in external)
+            for kind in ("referenced", "related", "citing")
+        }
+        db.add_paper_activity(
+            paper_id,
+            "수집 완료: 참고문헌 {referenced}편 · 관련 연구 {related}편 · 피인용 {citing}편".format(**source_counts),
+            "success",
+        )
+        for warning in warnings:
+            db.add_paper_activity(paper_id, warning, "warning")
+
+        db.add_paper_activity(paper_id, "Mac mini Ollama로 논문 맥락을 분석하는 중")
+        model = OllamaClient()
+        profile = await model.profile(payload["title"], payload["full_text"])
+        payload["profile"] = profile
+        db.set_paper(paper_id, progress=18, payload=payload)
+        db.add_paper_activity(paper_id, "논문 맥락과 핵심 주제 분석 완료", "success")
 
         words = {word["id"]: word for page in payload["pages"] for word in page["words"]}
         translations: dict[str, Any] = {}
         sentences = payload["sentences"]
+        db.add_paper_activity(paper_id, f"문장 번역 시작: {len(sentences)}문장")
         for index, sentence in enumerate(sentences):
             tokens = [words[word_id]["text"] for word_id in sentence["word_ids"]]
             result = await model.translate_sentence(
@@ -177,16 +215,22 @@ async def process_paper(paper_id: str) -> None:
             translations[sentence["id"]] = {
                 "translation": result["translation"], "units": units,
             }
-            if index % 3 == 0 or index + 1 == len(sentences):
-                db.set_paper(paper_id, progress=12 + int(86 * (index + 1) / len(sentences)))
+            if (index + 1) % 3 == 0 or index + 1 == len(sentences):
+                db.set_paper(paper_id, progress=18 + int(80 * (index + 1) / len(sentences)))
+                db.add_paper_activity(
+                    paper_id, f"문장 번역 진행: {index + 1}/{len(sentences)}",
+                )
 
         payload["translations"] = translations
         payload["chunks"] = build_chunks(sentences, external, payload["title"])
         db.set_paper(paper_id, payload=payload, status="ready", progress=100, error="")
+        db.add_paper_activity(paper_id, "논문 분석과 번역이 완료됐습니다", "success")
     except (ModelUnavailable, InvalidModelOutput) as exc:
         db.set_paper(paper_id, status="failed", error=str(exc))
+        db.add_paper_activity(paper_id, str(exc), "error")
     except Exception:
         db.set_paper(paper_id, status="failed", error="논문 분석 중 오류가 발생했습니다. 서버 로그를 확인하세요.")
+        db.add_paper_activity(paper_id, "분석 중 예기치 못한 오류가 발생했습니다", "error")
         raise
 
 
@@ -226,17 +270,23 @@ def get_paper(paper_id: str, _user: str = Depends(require_user)) -> dict[str, An
     response = {
         "id": paper_id, "title": paper["title"], "status": paper["status"],
         "progress": paper["progress"], "error": paper["error"],
+        "activity": db.list_paper_activity(paper_id),
     }
-    if paper["status"] == "ready":
-        data = paper["data"]
+    data = paper["data"]
+    sources_ready = "external_sources" in data
+    response["sources_ready"] = sources_ready
+    if sources_ready:
         response.update({
-            "pages": data["pages"], "sentences": data["sentences"],
-            "translations": data["translations"], "profile": data["profile"],
             "sources": [
                 {key: value for key, value in source.items() if key != "text"}
                 for source in data["external_sources"]
             ],
-            "source_warnings": data["source_warnings"],
+            "source_warnings": data.get("source_warnings", []),
+        })
+    if paper["status"] == "ready":
+        response.update({
+            "pages": data["pages"], "sentences": data["sentences"],
+            "translations": data["translations"], "profile": data["profile"],
         })
     return response
 
