@@ -5,6 +5,7 @@ import hmac
 import re
 import time
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -14,7 +15,7 @@ from pydantic import BaseModel, Field
 
 from . import db
 from .config import settings
-from .llm import InvalidModelOutput, ModelUnavailable, OllamaClient
+from .llm import InvalidModelOutput, ModelUnavailable, VLLMClient
 from .pdf import extract_pdf
 from .rag import build_chunks, retrieve
 from .sources import collect_external_sources
@@ -22,7 +23,28 @@ from .sources import collect_external_sources
 
 app = FastAPI(title="Readpaper API", version="0.1.0")
 
-_ollama_lock = asyncio.Lock()
+_gloss_locks: dict[tuple[str, str], asyncio.Lock] = {}
+_gloss_lock_users: dict[tuple[str, str], int] = {}
+_gloss_locks_guard = asyncio.Lock()
+
+
+@asynccontextmanager
+async def _gloss_request_lock(key: tuple[str, str]):
+    """Deduplicate the same term while allowing vLLM to batch different requests."""
+    async with _gloss_locks_guard:
+        lock = _gloss_locks.setdefault(key, asyncio.Lock())
+        _gloss_lock_users[key] = _gloss_lock_users.get(key, 0) + 1
+    try:
+        async with lock:
+            yield
+    finally:
+        async with _gloss_locks_guard:
+            users = _gloss_lock_users[key] - 1
+            if users:
+                _gloss_lock_users[key] = users
+            else:
+                _gloss_lock_users.pop(key, None)
+                _gloss_locks.pop(key, None)
 
 
 class LoginRequest(BaseModel):
@@ -343,7 +365,7 @@ async def translate_word(paper_id: str, body: WordTranslationRequest,
     context_ms = round((time.monotonic() - context_started) * 1000)
 
     started = time.monotonic()
-    async with _ollama_lock:
+    async with _gloss_request_lock((paper_id, body.word_id)):
         lock_wait_ms = round((time.monotonic() - started) * 1000)
         # Another click may have completed while this request waited for the local model.
         latest = db.get_paper(paper_id, touch=False)
@@ -353,7 +375,7 @@ async def translate_word(paper_id: str, body: WordTranslationRequest,
                 "cached": True, "elapsed_ms": 0,
                 "activity": db.list_paper_activity(paper_id),
             }
-        model = OllamaClient()
+        model = VLLMClient()
         try:
             result = await model.translate_keyword(
                 data["title"], sentence["text"], tokens, focus_index, passages,
@@ -387,20 +409,14 @@ async def translate_word(paper_id: str, body: WordTranslationRequest,
     return unit | {
         "cached": False, "elapsed_ms": elapsed_ms, "context_count": len(passages),
         "timing": {
-            "model": settings.ollama_gloss_model,
+            "provider": "vllm",
+            "model": settings.llm_model,
             "context_ms": context_ms,
             "lock_wait_ms": lock_wait_ms,
             "model_request_ms": model_request_ms,
-            "ollama_total_ms": round(model_metrics["total_duration"] / 1_000_000)
-            if "total_duration" in model_metrics else None,
-            "ollama_load_ms": round(model_metrics["load_duration"] / 1_000_000)
-            if "load_duration" in model_metrics else None,
-            "prompt_eval_ms": round(model_metrics["prompt_eval_duration"] / 1_000_000)
-            if "prompt_eval_duration" in model_metrics else None,
-            "generation_ms": round(model_metrics["eval_duration"] / 1_000_000)
-            if "eval_duration" in model_metrics else None,
-            "prompt_tokens": model_metrics.get("prompt_eval_count"),
-            "generated_tokens": model_metrics.get("eval_count"),
+            "provider_request_ms": model_metrics.get("request_ms"),
+            "prompt_tokens": model_metrics.get("prompt_tokens"),
+            "generated_tokens": model_metrics.get("completion_tokens"),
         },
         "activity": db.list_paper_activity(paper_id),
     }
@@ -412,14 +428,13 @@ async def ask_paper(paper_id: str, body: QuestionRequest,
     paper = db.get_paper(paper_id)
     if paper is None or paper["status"] != "ready":
         raise HTTPException(status_code=404, detail="읽을 준비가 된 논문이 없습니다.")
-    model = OllamaClient()
+    model = VLLMClient()
     try:
-        async with _ollama_lock:
-            english_query = await model.search_query(body.question)
-            contexts = retrieve(english_query, paper["data"]["chunks"])
-            if not contexts:
-                return {"answer": "수집한 자료에서 이 질문의 근거를 찾지 못했습니다.", "citations": [], "sources": []}
-            result = await model.answer(body.question, contexts)
+        english_query = await model.search_query(body.question)
+        contexts = retrieve(english_query, paper["data"]["chunks"])
+        if not contexts:
+            return {"answer": "수집한 자료에서 이 질문의 근거를 찾지 못했습니다.", "citations": [], "sources": []}
+        result = await model.answer(body.question, contexts)
         selected = [
             {key: value for key, value in source.items() if key != "text"}
             | {"excerpt": source["text"][:350]}

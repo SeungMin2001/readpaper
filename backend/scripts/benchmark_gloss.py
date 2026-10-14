@@ -1,4 +1,4 @@
-"""Compare warm Ollama glossary latency and inspect contextual term meanings."""
+"""Measure vLLM glossary latency on sample or saved paper terms."""
 
 import argparse
 import asyncio
@@ -8,13 +8,11 @@ import sys
 import time
 from pathlib import Path
 
-import httpx
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from readpaper import db  # noqa: E402
 from readpaper.config import settings  # noqa: E402
-from readpaper.llm import OllamaClient  # noqa: E402
+from readpaper.llm import VLLMClient  # noqa: E402
 from readpaper.main import _word_context  # noqa: E402
 
 
@@ -57,15 +55,6 @@ CASES = [
 ]
 
 
-async def preload(model: str) -> None:
-    async with httpx.AsyncClient(timeout=120) as client:
-        response = await client.post(
-            f"{settings.ollama_url}/api/generate",
-            json={"model": model, "prompt": "", "stream": False, "keep_alive": "30m"},
-        )
-        response.raise_for_status()
-
-
 def latest_paper_cases(limit: int) -> list[dict]:
     with db.connect() as connection:
         row = connection.execute(
@@ -105,34 +94,31 @@ def latest_paper_cases(limit: int) -> list[dict]:
     return cases
 
 
-async def benchmark(models: list[str], cases: list[dict]) -> None:
-    for model in models:
-        print(f"\n{model} (warm)", flush=True)
-        await preload(model)
-        durations = []
-        for case in cases:
-            client = OllamaClient()
-            sentence = case["sentence"]
-            tokens = case.get("tokens") or sentence.split()
-            passages = case["passages"] if "passages" in case else [sentence, case["context"]]
-            started = time.monotonic()
-            result = await client.translate_keyword(
-                case["title"], sentence, tokens, case["focus"],
-                passages, model=model,
-            )
-            wall_ms = round((time.monotonic() - started) * 1000)
-            durations.append(wall_ms)
-            metrics = client.last_metrics
-            term = " ".join(tokens[result["start"]:result["end"]])
-            prompt_ms = round(metrics.get("prompt_eval_duration", 0) / 1_000_000)
-            generation_ms = round(metrics.get("eval_duration", 0) / 1_000_000)
-            print(
-                f"{case['label']}: {wall_ms}ms "
-                f"(input {prompt_ms}ms, output {generation_ms}ms) "
-                f"{term} → {result['meaning']}",
-                flush=True,
-            )
-        print(f"median: {round(statistics.median(durations))}ms", flush=True)
+async def benchmark(cases: list[dict]) -> None:
+    print(f"\n{settings.llm_model} via {settings.llm_base_url}", flush=True)
+    durations = []
+    for case in cases:
+        client = VLLMClient()
+        sentence = case["sentence"]
+        tokens = case.get("tokens") or sentence.split()
+        passages = case["passages"] if "passages" in case else [sentence, case["context"]]
+        started = time.monotonic()
+        result = await client.translate_keyword(
+            case["title"], sentence, tokens, case["focus"], passages,
+        )
+        wall_ms = round((time.monotonic() - started) * 1000)
+        durations.append(wall_ms)
+        metrics = client.last_metrics
+        term = " ".join(tokens[result["start"]:result["end"]])
+        print(
+            f"{case['label']}: {wall_ms}ms "
+            f"(request {metrics.get('request_ms')}ms, "
+            f"input {metrics.get('prompt_tokens')} tokens, "
+            f"output {metrics.get('completion_tokens')} tokens) "
+            f"{term} → {result['meaning']}",
+            flush=True,
+        )
+    print(f"median: {round(statistics.median(durations))}ms", flush=True)
 
 
 if __name__ == "__main__":
@@ -141,8 +127,5 @@ if __name__ == "__main__":
         "--latest-paper", action="store_true",
         help="use up to five saved term locations from the most recently opened paper",
     )
-    parser.add_argument("models", nargs="+", help="Ollama model names to compare")
     args = parser.parse_args()
-    asyncio.run(benchmark(
-        args.models, latest_paper_cases(5) if args.latest_paper else CASES,
-    ))
+    asyncio.run(benchmark(latest_paper_cases(5) if args.latest_paper else CASES))

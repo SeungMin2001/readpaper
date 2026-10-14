@@ -1,5 +1,6 @@
 import json
 import re
+import time
 from typing import Any
 
 import httpx
@@ -28,53 +29,71 @@ def _parse_json(content: str) -> dict[str, Any]:
     return value
 
 
-class OllamaClient:
+class VLLMClient:
     def __init__(self) -> None:
         self.last_metrics: dict[str, int] = {}
 
     async def chat_json(
         self, system: str, user: str, *, schema: dict[str, Any] | None = None,
-        options: dict[str, Any] | None = None, keep_alive: str = "30m",
-        model: str | None = None,
+        options: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         self.last_metrics = {}
+        request_started = time.monotonic()
+        options = options or {}
+        payload: dict[str, Any] = {
+            "model": settings.llm_model,
+            "stream": False,
+            "temperature": options.get("temperature", 0),
+            "max_tokens": options.get("num_predict", 512),
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "response_format": (
+                {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "readpaper_response",
+                        "strict": True,
+                        "schema": schema,
+                    },
+                }
+                if schema else {"type": "json_object"}
+            ),
+        }
+        headers = {"Authorization": f"Bearer {settings.llm_api_key}"} if settings.llm_api_key else {}
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(240.0, connect=10.0)) as client:
                 response = await client.post(
-                    f"{settings.ollama_url}/api/chat",
-                    json={
-                        "model": model or settings.ollama_model,
-                        "stream": False,
-                        "format": schema or "json",
-                        "think": False,
-                        "keep_alive": keep_alive,
-                        "options": options or {"temperature": 0, "num_ctx": 8192},
-                        "messages": [
-                            {"role": "system", "content": system},
-                            {"role": "user", "content": user},
-                        ],
-                    },
+                    f"{settings.llm_base_url}/chat/completions",
+                    json=payload,
+                    headers=headers,
                 )
                 response.raise_for_status()
-                payload = response.json()
+                result = response.json()
+                usage = result.get("usage") or {}
                 self.last_metrics = {
-                    key: payload[key]
-                    for key in (
-                        "total_duration", "load_duration", "prompt_eval_duration",
-                        "eval_duration", "prompt_eval_count", "eval_count",
-                    )
-                    if isinstance(payload.get(key), int)
+                    "request_ms": round((time.monotonic() - request_started) * 1000),
+                    "prompt_tokens": usage.get("prompt_tokens"),
+                    "completion_tokens": usage.get("completion_tokens"),
                 }
-                return _parse_json(payload["message"]["content"])
-        except (httpx.HTTPError, KeyError, TypeError, ValueError) as exc:
+                content = result["choices"][0]["message"]["content"]
+                if isinstance(content, list):
+                    content = "".join(
+                        part.get("text", "") for part in content if isinstance(part, dict)
+                    )
+                if not isinstance(content, str):
+                    raise TypeError("vLLM returned a non-text response")
+                return _parse_json(content)
+        except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError) as exc:
             raise ModelUnavailable(
-                "Mac mini의 Ollama 서버에 연결하거나 응답을 읽을 수 없습니다. "
-                "READPAPER_OLLAMA_URL과 모델 이름을 확인하세요."
+                "vLLM 서버에 연결하거나 응답을 읽을 수 없습니다. "
+                "READPAPER_LLM_BASE_URL과 READPAPER_LLM_MODEL 설정을 확인하세요."
             ) from exc
 
     async def translate_keyword(
         self, title: str, sentence: str, tokens: list[str], focus_index: int,
-        paper_passages: list[str], *, model: str | None = None,
+        paper_passages: list[str],
     ) -> dict[str, Any]:
         if not tokens or not 0 <= focus_index < len(tokens):
             raise InvalidModelOutput("선택한 단어의 문장 위치가 올바르지 않습니다.")
@@ -105,8 +124,7 @@ class OllamaClient:
             "end (exclusive), and meaning. No explanation.",
             json.dumps(request, ensure_ascii=False),
             schema=schema,
-            options={"temperature": 0, "num_ctx": 4096, "num_predict": 96},
-            model=model or settings.ollama_gloss_model,
+            options={"temperature": 0, "num_predict": 96},
         )
         return validate_keyword_gloss(result, len(tokens), focus_index)
 

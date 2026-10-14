@@ -44,7 +44,7 @@ def example_pdf() -> bytes:
     return document.tobytes()
 
 
-class FakeOllama:
+class FakeVLLM:
     def __init__(self):
         self.keyword_calls = 0
         self.last_passages = []
@@ -124,9 +124,9 @@ class ReadpaperFlowTests(unittest.TestCase):
     def test_upload_keyword_gloss_rag_and_vocabulary(self):
         with tempfile.TemporaryDirectory() as directory:
             config = Settings(data_dir=Path(directory), dev_mode=True)
-            fake_model = FakeOllama()
+            fake_model = FakeVLLM()
             with patch("readpaper.db.settings", config), patch("readpaper.main.settings", config), \
-                    patch("readpaper.main.OllamaClient", return_value=fake_model), \
+                    patch("readpaper.main.VLLMClient", return_value=fake_model), \
                     patch("readpaper.main.collect_external_sources", fake_sources):
                 with TestClient(app) as client:
                     pdf_bytes = example_pdf()
@@ -152,7 +152,7 @@ class ReadpaperFlowTests(unittest.TestCase):
                     self.assertEqual(len(first_unit["word_ids"]), 2)
                     self.assertIn("timing", first_unit)
                     self.assertIsNotNone(first_unit["timing"]["context_ms"])
-                    self.assertIsNone(first_unit["timing"]["ollama_total_ms"])
+                    self.assertIsNone(first_unit["timing"]["provider_request_ms"])
                     self.assertGreaterEqual(len(fake_model.last_passages), 1)
                     cached_gloss = client.post(
                         f"/api/papers/{paper_id}/translate-word", json={"word_id": "w1"},
@@ -189,14 +189,14 @@ class ReadpaperFlowTests(unittest.TestCase):
                     self.assertEqual(len(client.get("/api/vocabulary").json()), 1)
 
     def test_discovered_sources_are_visible_if_local_model_is_unavailable(self):
-        class OfflineOllama:
+        class OfflineVLLM:
             async def translate_keyword(self, *args, **kwargs):
-                raise ModelUnavailable("Mac mini Ollama is offline")
+                raise ModelUnavailable("Mac mini vLLM is offline")
 
         with tempfile.TemporaryDirectory() as directory:
             config = Settings(data_dir=Path(directory), dev_mode=True)
             with patch("readpaper.db.settings", config), patch("readpaper.main.settings", config), \
-                    patch("readpaper.main.OllamaClient", OfflineOllama), \
+                    patch("readpaper.main.VLLMClient", OfflineVLLM), \
                     patch("readpaper.main.collect_external_sources", fake_sources):
                 with TestClient(app) as client:
                     upload = client.post(
