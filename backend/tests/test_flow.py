@@ -16,7 +16,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from readpaper import db  # noqa: E402
 from readpaper.config import Settings  # noqa: E402
-from readpaper.llm import InvalidModelOutput, ModelUnavailable, validate_keyword_gloss  # noqa: E402
+from readpaper.llm import ModelUnavailable  # noqa: E402
 from readpaper.main import _word_context, app  # noqa: E402
 from readpaper.pdf import extract_pdf  # noqa: E402
 from readpaper.rag import build_chunks, retrieve  # noqa: E402
@@ -219,10 +219,6 @@ class ReadpaperFlowTests(unittest.TestCase):
                         503,
                     )
                     self.assertEqual(client.get(f"/api/papers/{paper_id}").json()["status"], "ready")
-
-    def test_model_gloss_span_must_include_clicked_token(self):
-        with self.assertRaises(InvalidModelOutput):
-            validate_keyword_gloss({"start": 0, "end": 1, "meaning": "뜻"}, 3, 2)
 
     def test_word_context_uses_other_passages_from_uploaded_paper_only(self):
         sentences = [

@@ -1,6 +1,7 @@
 import json
 import re
 import time
+import unicodedata
 from typing import Any
 
 import httpx
@@ -100,16 +101,16 @@ class VLLMClient:
         schema = {
             "type": "object",
             "properties": {
-                "start": {"type": "integer", "minimum": 0},
-                "end": {"type": "integer", "minimum": 1},
+                "term": {"type": "string"},
                 "meaning": {"type": "string"},
             },
-            "required": ["start", "end", "meaning"],
+            "required": ["term", "meaning"],
             "additionalProperties": False,
         }
         request = {
             "paper_title": title,
             "focus_index": focus_index,
+            "clicked_token": tokens[focus_index],
             "tokens": tokens,
             "sentence": sentence,
             "other_passages_from_this_paper": [
@@ -117,16 +118,17 @@ class VLLMClient:
             ],
         }
         result = await self.chat_json(
-            "Give a short Korean gloss for the clicked scientific term. Use the paper title, "
+            "Give a short Korean gloss for the clicked scientific word. Use the paper title, "
             "sentence, and other passages to choose its meaning. If the clicked token belongs "
-            "to a standard multiword technical term, select the smallest complete term span; "
-            "otherwise select only that token. Return zero-based token start (inclusive), "
-            "end (exclusive), and meaning. No explanation.",
+            "to a standard multiword technical term, select the smallest complete term; "
+            "otherwise select only the clicked token. Return term as an exact contiguous copy "
+            "of the English token or tokens, including the clicked token, and meaning as its "
+            "short Korean gloss. Do not return token indices or an explanation.",
             json.dumps(request, ensure_ascii=False),
             schema=schema,
             options={"temperature": 0, "num_predict": 96},
         )
-        return validate_keyword_gloss(result, len(tokens), focus_index)
+        return validate_keyword_gloss(result, tokens, focus_index)
 
     async def search_query(self, korean_question: str) -> str:
         result = await self.chat_json(
@@ -189,34 +191,45 @@ class VLLMClient:
         return {"answer": answer, "citations": list(dict.fromkeys(clean_citations))}
 
 
+def _word_parts(value: str) -> list[str]:
+    return re.findall(r"[^\W_]+", unicodedata.normalize("NFKC", value).casefold())
+
+
 def validate_keyword_gloss(
-    result: dict[str, Any], token_count: int, focus_index: int,
+    result: dict[str, Any], tokens: list[str], focus_index: int,
 ) -> dict[str, Any]:
-    start, end, meaning = result.get("start"), result.get("end"), result.get("meaning")
-    valid_span = (
-        type(start) is int and type(end) is int and start >= 0 and end > start
-        and end <= token_count and start <= focus_index < end
-    )
-    if not valid_span and type(start) is int and type(end) is int:
-        # Models sometimes return one-based positions or an inclusive end index.
-        # Try common conventions, accepting only a valid range containing the click.
-        alternatives = (
-            (start - 1, end - 1),  # one-based, exclusive end
-            (start, end + 1),       # zero-based, inclusive end
-            (start - 1, end),       # one-based, inclusive end
-        )
-        for adjusted_start, adjusted_end in alternatives:
-            if (adjusted_start >= 0 and adjusted_end > adjusted_start
-                    and adjusted_end <= token_count
-                    and adjusted_start <= focus_index < adjusted_end):
-                start, end = adjusted_start, adjusted_end
-                valid_span = True
-                break
-    if not valid_span:
-        raise InvalidModelOutput("용어 범위가 선택한 단어를 포함하지 않거나 문장 범위를 벗어났습니다.")
+    meaning = result.get("meaning")
     if not isinstance(meaning, str) or not meaning.strip() or len(meaning) > 100:
         raise InvalidModelOutput("용어 뜻이 없거나 너무 깁니다.")
-    return {"start": start, "end": end, "meaning": meaning.strip()}
+    if not tokens or not 0 <= focus_index < len(tokens):
+        raise InvalidModelOutput("선택한 단어의 문장 위치가 올바르지 않습니다.")
+
+    # Match the model's copied phrase to PDF tokens. A phrase must include the
+    # clicked token, even when the same words occur elsewhere in the sentence.
+    term = result.get("term")
+    term_parts = _word_parts(term) if isinstance(term, str) else []
+    sentence_parts: list[str] = []
+    source_indices: list[int] = []
+    for index, token in enumerate(tokens):
+        for part in _word_parts(token):
+            sentence_parts.append(part)
+            source_indices.append(index)
+
+    if term_parts:
+        for offset in range(len(sentence_parts) - len(term_parts) + 1):
+            after = offset + len(term_parts)
+            if sentence_parts[offset:after] != term_parts:
+                continue
+            start, end = source_indices[offset], source_indices[after - 1] + 1
+            if (start <= focus_index < end and end - start <= 6
+                    and (offset == 0 or source_indices[offset - 1] != start)
+                    and (after == len(source_indices) or source_indices[after] != end - 1)):
+                return {"start": start, "end": end, "meaning": meaning.strip()}
+
+    # The model may paraphrase a phrase instead of copying it. The gloss is
+    # still for the clicked word, so preserve that translation without
+    # highlighting unrelated words or failing the request.
+    return {"start": focus_index, "end": focus_index + 1, "meaning": meaning.strip()}
 
 
 def validate_related_selection(

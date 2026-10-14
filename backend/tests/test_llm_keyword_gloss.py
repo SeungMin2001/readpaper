@@ -15,7 +15,7 @@ from readpaper.config import settings  # noqa: E402
 class KeywordGlossTests(unittest.IsolatedAsyncioTestCase):
     async def test_uses_openai_compatible_vllm_chat_endpoint(self):
         response_payload = {
-            "choices": [{"message": {"content": '{"start":0,"end":1,"meaning":"주의"}'}}],
+            "choices": [{"message": {"content": '{"term":"attention","meaning":"주의"}'}}],
             "usage": {"prompt_tokens": 400, "completion_tokens": 20},
         }
         requests = []
@@ -46,7 +46,7 @@ class KeywordGlossTests(unittest.IsolatedAsyncioTestCase):
     async def test_requests_only_short_contextual_keyword_gloss(self):
         client = VLLMClient()
         client.chat_json = AsyncMock(return_value={
-            "start": 0, "end": 2, "meaning": "강화학습",
+            "term": "Reinforcement learning", "meaning": "강화학습",
         })
 
         result = await client.translate_keyword(
@@ -65,39 +65,37 @@ class KeywordGlossTests(unittest.IsolatedAsyncioTestCase):
         args, kwargs = client.chat_json.await_args
         request = json.loads(args[1])
         self.assertEqual(request["focus_index"], 1)
+        self.assertEqual(request["clicked_token"], "learning")
         self.assertEqual(request["tokens"][1], "learning")
         self.assertEqual(len(request["other_passages_from_this_paper"]), 2)
         self.assertEqual(kwargs["options"]["num_predict"], 96)
+        self.assertEqual(set(kwargs["schema"]["properties"]), {"term", "meaning"})
 
-    def test_gloss_span_must_contain_clicked_token(self):
-        with self.assertRaises(InvalidModelOutput):
-            validate_keyword_gloss({"start": 0, "end": 1, "meaning": "강화"}, 3, 2)
-
-    def test_corrects_one_based_span_when_it_covers_clicked_token(self):
+    def test_matches_repeated_term_at_clicked_occurrence(self):
         result = validate_keyword_gloss(
-            {"start": 2, "end": 3, "meaning": "학습"}, token_count=4, focus_index=1,
+            {"term": "attention", "meaning": "주의"},
+            ["Attention", "improves", "attention", "models."], 2,
         )
+        self.assertEqual(result, {"start": 2, "end": 3, "meaning": "주의"})
 
-        self.assertEqual(result, {"start": 1, "end": 2, "meaning": "학습"})
-
-    def test_corrects_inclusive_end_span_when_it_covers_clicked_token(self):
+    def test_matches_hyphenated_pdf_token(self):
         result = validate_keyword_gloss(
-            {"start": 1, "end": 1, "meaning": "학습"}, token_count=4, focus_index=1,
+            {"term": "self attention", "meaning": "자기 주의"},
+            ["self-attention", "layers."], 0,
         )
+        self.assertEqual(result, {"start": 0, "end": 1, "meaning": "자기 주의"})
 
-        self.assertEqual(result, {"start": 1, "end": 2, "meaning": "학습"})
-
-    def test_corrects_one_based_inclusive_span_when_it_covers_clicked_token(self):
+    def test_unmatched_term_falls_back_to_clicked_word(self):
         result = validate_keyword_gloss(
-            {"start": 2, "end": 2, "meaning": "학습"}, token_count=4, focus_index=1,
+            {"term": "unrelated term", "meaning": "문맥 임베딩"},
+            ["contextual", "embedding", "model"], 1,
         )
+        self.assertEqual(result, {"start": 1, "end": 2, "meaning": "문맥 임베딩"})
 
-        self.assertEqual(result, {"start": 1, "end": 2, "meaning": "학습"})
-
-    def test_does_not_correct_one_based_span_if_it_still_misses_clicked_token(self):
+    def test_rejects_empty_meaning(self):
         with self.assertRaises(InvalidModelOutput):
             validate_keyword_gloss(
-                {"start": 1, "end": 2, "meaning": "학습"}, token_count=4, focus_index=3,
+                {"term": "attention", "meaning": " "}, ["attention"], 0,
             )
 
 
