@@ -45,6 +45,15 @@ def init_db() -> None:
                 state TEXT NOT NULL,
                 message TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS gloss_preparation (
+                paper_id TEXT PRIMARY KEY REFERENCES papers(id) ON DELETE CASCADE,
+                status TEXT NOT NULL,
+                total INTEGER NOT NULL,
+                ready INTEGER NOT NULL DEFAULT 0,
+                failed INTEGER NOT NULL DEFAULT 0,
+                error TEXT,
+                updated_at REAL NOT NULL
+            );
         """)
 
 
@@ -62,6 +71,62 @@ def fail_interrupted_jobs() -> None:
             "UPDATE papers SET status = 'failed', "
             "error = '서버 재시작으로 분석이 중단되었습니다. 다시 시도해 주세요.' "
             "WHERE status = 'processing'"
+        )
+        db.execute(
+            "UPDATE gloss_preparation SET status = 'failed', "
+            "error = '서버 재시작으로 용어 준비가 중단되었습니다.', updated_at = ? "
+            "WHERE status IN ('queued', 'running')",
+            (time.time(),),
+        )
+
+
+def get_gloss_preparation(paper_id: str) -> dict[str, Any] | None:
+    with connect() as db:
+        row = db.execute(
+            "SELECT status, total, ready, failed, error FROM gloss_preparation "
+            "WHERE paper_id = ?",
+            (paper_id,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def claim_gloss_preparation(paper_id: str, total: int) -> bool:
+    """Only one request may launch or retry a preparation job."""
+    with connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        row = db.execute(
+            "SELECT status FROM gloss_preparation WHERE paper_id = ?", (paper_id,),
+        ).fetchone()
+        if row and row["status"] != "failed":
+            return False
+        db.execute(
+            "INSERT INTO gloss_preparation "
+            "(paper_id, status, total, ready, failed, error, updated_at) "
+            "VALUES (?, 'queued', ?, 0, 0, NULL, ?) "
+            "ON CONFLICT(paper_id) DO UPDATE SET "
+            "status = 'queued', total = excluded.total, ready = 0, failed = 0, "
+            "error = NULL, updated_at = excluded.updated_at",
+            (paper_id, total, time.time()),
+        )
+    return True
+
+
+def update_gloss_preparation(paper_id: str, *, status: str | None = None,
+                             ready_delta: int = 0, failed_delta: int = 0,
+                             error: str | None = None) -> None:
+    fields = ["updated_at = ?", "ready = ready + ?", "failed = failed + ?"]
+    values: list[Any] = [time.time(), ready_delta, failed_delta]
+    if status is not None:
+        fields.append("status = ?")
+        values.append(status)
+    if error is not None:
+        fields.append("error = ?")
+        values.append(error[:300])
+    values.append(paper_id)
+    with connect() as db:
+        db.execute(
+            f"UPDATE gloss_preparation SET {', '.join(fields)} WHERE paper_id = ?",
+            values,
         )
 
 

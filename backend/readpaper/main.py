@@ -2,6 +2,7 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import logging
 import re
 import time
 import uuid
@@ -15,6 +16,7 @@ from pydantic import BaseModel, Field
 
 from . import db
 from .config import settings
+from .gloss_preparation import select_paper_candidates
 from .llm import InvalidModelOutput, ModelUnavailable, VLLMClient
 from .pdf import extract_pdf
 from .rag import build_chunks, retrieve
@@ -22,6 +24,7 @@ from .sources import collect_external_sources
 
 
 app = FastAPI(title="Readpaper API", version="0.1.0")
+logger = logging.getLogger(__name__)
 
 _gloss_locks: dict[tuple[str, str], asyncio.Lock] = {}
 _gloss_lock_users: dict[tuple[str, str], int] = {}
@@ -254,11 +257,65 @@ async def process_paper(paper_id: str) -> None:
         chunks = build_chunks(payload["sentences"], external, payload["title"])
         db.merge_paper_data(paper_id, {"chunks": chunks})
         db.set_paper(paper_id, status="ready", progress=100, error="")
-        db.add_paper_activity(paper_id, "원문·문헌·검색 문맥 준비 완료. 용어 뜻은 클릭할 때 생성합니다.", "success")
+        db.add_paper_activity(paper_id, "원문·문헌·검색 문맥 준비 완료.", "success")
     except Exception:
         db.set_paper(paper_id, status="failed", error="논문 분석 중 오류가 발생했습니다. 서버 로그를 확인하세요.")
         db.add_paper_activity(paper_id, "분석 중 예기치 못한 오류가 발생했습니다", "error")
         raise
+
+
+async def prepare_glosses(paper_id: str, word_ids: list[str]) -> None:
+    """Translate selected terms concurrently so the upload has one observable job."""
+    db.update_gloss_preparation(paper_id, status="running")
+    semaphore = asyncio.Semaphore(3)
+    errors: list[str] = []
+
+    async def prepare_one(word_id: str) -> None:
+        async with semaphore:
+            try:
+                await _translate_word(paper_id, word_id, record_activity=False)
+                db.update_gloss_preparation(paper_id, ready_delta=1)
+            except HTTPException as exc:
+                errors.append(str(exc.detail))
+                db.update_gloss_preparation(paper_id, failed_delta=1)
+            except Exception:
+                logger.exception("Gloss preparation failed for paper %s, word %s", paper_id, word_id)
+                errors.append("용어 번역 중 예기치 못한 오류가 발생했습니다.")
+                db.update_gloss_preparation(paper_id, failed_delta=1)
+
+    try:
+        await asyncio.gather(*(prepare_one(word_id) for word_id in word_ids))
+        ready = db.get_gloss_preparation(paper_id)
+        if ready and ready["ready"] == 0 and ready["failed"]:
+            db.update_gloss_preparation(paper_id, status="failed", error=errors[0])
+        else:
+            db.update_gloss_preparation(
+                paper_id, status="completed", error=errors[0] if errors else None,
+            )
+    except Exception:
+        logger.exception("Gloss preparation job failed for paper %s", paper_id)
+        db.update_gloss_preparation(
+            paper_id, status="failed", error="용어 준비 중 예기치 못한 오류가 발생했습니다.",
+        )
+        raise
+
+
+async def prepare_new_paper(paper_id: str, word_ids: list[str]) -> None:
+    # External source discovery may be slow; local term preparation can run now.
+    results = await asyncio.gather(
+        process_paper(paper_id), prepare_glosses(paper_id, word_ids),
+        return_exceptions=True,
+    )
+    for result in results:
+        if isinstance(result, Exception):
+            logger.error("Paper background job failed for %s: %s", paper_id, result)
+
+
+def _start_gloss_preparation(paper_id: str, data: dict[str, Any],
+                             background: BackgroundTasks) -> None:
+    word_ids = select_paper_candidates(data)
+    if db.claim_gloss_preparation(paper_id, len(word_ids)):
+        background.add_task(prepare_glosses, paper_id, word_ids)
 
 
 @app.post("/api/papers/upload")
@@ -276,15 +333,19 @@ async def upload_paper(background: BackgroundTasks, file: UploadFile = File(...)
     content_hash = hashlib.sha256(data).hexdigest()
     cached = db.find_cached_paper(content_hash)
     if cached:
+        _start_gloss_preparation(cached["id"], cached["data"], background)
         return {"paper_id": cached["id"], "status": "ready", "cached": True}
     try:
         parsed = extract_pdf(data)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     parsed["content_hash"] = content_hash
+    parsed["chunks"] = build_chunks(parsed["sentences"], [], parsed["title"])
     paper_id = uuid.uuid4().hex
     db.create_paper(paper_id, parsed["title"], parsed)
-    background.add_task(process_paper, paper_id)
+    word_ids = select_paper_candidates(parsed)
+    db.claim_gloss_preparation(paper_id, len(word_ids))
+    background.add_task(prepare_new_paper, paper_id, word_ids)
     return {"paper_id": paper_id, "status": "processing", "cached": False}
 
 
@@ -317,6 +378,33 @@ def get_paper(paper_id: str, _user: str = Depends(require_user)) -> dict[str, An
     return response
 
 
+def _gloss_preparation_response(paper_id: str) -> dict[str, Any]:
+    paper = db.get_paper(paper_id)
+    if paper is None:
+        raise HTTPException(status_code=404, detail="논문을 찾을 수 없습니다.")
+    status = db.get_gloss_preparation(paper_id)
+    return (status or {"status": "pending", "total": 0, "ready": 0,
+                       "failed": 0, "error": None}) | {
+        "word_glosses": paper["data"].get("word_glosses", {}),
+    }
+
+
+@app.get("/api/papers/{paper_id}/gloss-preparation")
+def get_gloss_preparation(paper_id: str,
+                          _user: str = Depends(require_user)) -> dict[str, Any]:
+    return _gloss_preparation_response(paper_id)
+
+
+@app.post("/api/papers/{paper_id}/gloss-preparation")
+def retry_gloss_preparation(paper_id: str, background: BackgroundTasks,
+                            _user: str = Depends(require_user)) -> dict[str, Any]:
+    paper = db.get_paper(paper_id)
+    if paper is None:
+        raise HTTPException(status_code=404, detail="논문을 찾을 수 없습니다.")
+    _start_gloss_preparation(paper_id, paper["data"], background)
+    return _gloss_preparation_response(paper_id)
+
+
 @app.post("/api/papers/{paper_id}/retry")
 def retry_paper(paper_id: str, background: BackgroundTasks,
                 _user: str = Depends(require_user)) -> dict[str, str]:
@@ -333,6 +421,11 @@ def retry_paper(paper_id: str, background: BackgroundTasks,
 @app.post("/api/papers/{paper_id}/translate-word")
 async def translate_word(paper_id: str, body: WordTranslationRequest,
                          _user: str = Depends(require_user)) -> dict[str, Any]:
+    return await _translate_word(paper_id, body.word_id)
+
+
+async def _translate_word(paper_id: str, word_id: str,
+                          *, record_activity: bool = True) -> dict[str, Any]:
     paper = db.get_paper(paper_id)
     if paper is None:
         raise HTTPException(status_code=404, detail="논문을 찾을 수 없습니다.")
@@ -340,11 +433,11 @@ async def translate_word(paper_id: str, body: WordTranslationRequest,
     known_words = {
         word["id"]: word for page in data.get("pages", []) for word in page.get("words", [])
     }
-    word = known_words.get(body.word_id)
+    word = known_words.get(word_id)
     if word is None:
         raise HTTPException(status_code=404, detail="선택한 단어를 논문에서 찾을 수 없습니다.")
 
-    cached = data.get("word_glosses", {}).get(body.word_id)
+    cached = data.get("word_glosses", {}).get(word_id)
     if cached:
         return cached | {
             "cached": True, "elapsed_ms": 0,
@@ -359,17 +452,17 @@ async def translate_word(paper_id: str, body: WordTranslationRequest,
         raise HTTPException(status_code=422, detail="단어가 속한 문장을 찾을 수 없습니다.")
     sentence = sentences[sentence_index]
     tokens = [known_words[word_id]["text"] for word_id in sentence["word_ids"]]
-    focus_index = sentence["word_ids"].index(body.word_id)
+    focus_index = sentence["word_ids"].index(word_id)
     context_started = time.monotonic()
     passages = _word_context(sentences, word["text"], sentence["id"], data.get("chunks", []))
     context_ms = round((time.monotonic() - context_started) * 1000)
 
     started = time.monotonic()
-    async with _gloss_request_lock((paper_id, body.word_id)):
+    async with _gloss_request_lock((paper_id, word["sentence_id"])):
         lock_wait_ms = round((time.monotonic() - started) * 1000)
         # Another click may have completed while this request waited for the local model.
         latest = db.get_paper(paper_id, touch=False)
-        cached = (latest or {}).get("data", {}).get("word_glosses", {}).get(body.word_id)
+        cached = (latest or {}).get("data", {}).get("word_glosses", {}).get(word_id)
         if cached:
             return cached | {
                 "cached": True, "elapsed_ms": 0,
@@ -403,9 +496,10 @@ async def translate_word(paper_id: str, body: WordTranslationRequest,
         db.save_word_gloss(paper_id, word_ids, unit)
 
     elapsed_ms = round((time.monotonic() - started) * 1000)
-    db.add_paper_activity(
-        paper_id, f"용어 뜻 생성: {unit['original']} · {elapsed_ms / 1000:.1f}초", "success",
-    )
+    if record_activity:
+        db.add_paper_activity(
+            paper_id, f"용어 뜻 생성: {unit['original']} · {elapsed_ms / 1000:.1f}초", "success",
+        )
     return unit | {
         "cached": False, "elapsed_ms": elapsed_ms, "context_count": len(passages),
         "timing": {

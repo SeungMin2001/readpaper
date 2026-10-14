@@ -85,6 +85,18 @@ a { color: inherit; }
 .login-index { top: 35px; left: 38px; }
 .login-caption { right: 38px; bottom: 34px; }
 
+.preparation-page { min-height: calc(100vh - 66px); padding: 60px 20px; display: grid; place-items: center; }
+.preparation-card { width: min(520px, 100%); padding: 45px; border: 1px solid var(--line); border-radius: 8px; background: var(--paper); box-shadow: 0 14px 40px rgba(48,56,42,.045); }
+.preparation-card h1 { margin: 0 0 12px; color: var(--green-deep); font-family: 'DM Serif Display', 'Noto Sans KR', serif; font-size: clamp(25px, 4vw, 36px); font-weight: 400; line-height: 1.35; }
+.preparation-title { margin: 0 0 32px; color: var(--muted); font-size: 12px; line-height: 1.6; }
+.preparation-progress { height: 7px; overflow: hidden; border-radius: 20px; background: #e9eee7; }
+.preparation-progress span { height: 100%; display: block; border-radius: inherit; background: #6c9271; transition: width .35s ease; }
+.preparation-count { margin: 14px 0 0; color: #6a786d; font-size: 12px; }
+.preparation-count strong { color: var(--green-deep); font-size: 17px; }
+.preparation-note { margin: 22px 0 0; color: #879189; font-size: 11px; line-height: 1.75; }
+.preparation-actions { margin-top: 25px; display: flex; flex-wrap: wrap; gap: 9px; }
+.preparation-actions p { flex-basis: 100%; margin: 0 0 5px; color: #9a644d; font-size: 11px; line-height: 1.6; }
+
 /* Reading workspace */
 .workspace { width: min(1740px, 100%); margin: 0 auto; padding: 0 clamp(16px, 2.4vw, 38px) 38px; }
 .paper-toolbar { min-height: 88px; display: flex; align-items: center; gap: 13px; border-bottom: 1px solid #e1e0d9; }
@@ -399,4 +411,5 @@ a { color: inherit; }
   .manual-form { grid-template-columns: 1fr 1fr; }
   .manual-form .secondary-button { grid-column: 1 / -1; }
   .login-form .primary-button { justify-content: space-between; }
+  .preparation-card { padding: 30px 22px; }
 }

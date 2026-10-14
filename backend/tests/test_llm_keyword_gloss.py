@@ -64,9 +64,10 @@ class KeywordGlossTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, {"start": 0, "end": 2, "meaning": "강화학습"})
         args, kwargs = client.chat_json.await_args
         request = json.loads(args[1])
-        self.assertEqual(request["focus_index"], 1)
         self.assertEqual(request["clicked_token"], "learning")
-        self.assertEqual(request["tokens"][1], "learning")
+        self.assertEqual(request["before_clicked_token"], ["Reinforcement"])
+        self.assertEqual(request["after_clicked_token"], ["improves", "robotic", "control."])
+        self.assertNotIn("tokens", request)
         self.assertEqual(len(request["other_passages_from_this_paper"]), 2)
         self.assertEqual(kwargs["options"]["num_predict"], 96)
         self.assertEqual(set(kwargs["schema"]["properties"]), {"term", "meaning"})

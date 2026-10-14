@@ -1,4 +1,4 @@
-import type { ActivityEvent, Answer, Paper, VocabularyItem, WordGloss } from './types'
+import type { ActivityEvent, Answer, GlossPreparation, Paper, VocabularyItem, WordGloss } from './types'
 
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   const response = await fetch(path, { credentials: 'same-origin', ...options })
@@ -28,6 +28,8 @@ export const api = {
     })
   },
   paper: (id: string) => request<Paper>(`/api/papers/${id}`),
+  glossPreparation: (id: string) => request<GlossPreparation>(`/api/papers/${id}/gloss-preparation`),
+  retryGlossPreparation: (id: string) => request<GlossPreparation>(`/api/papers/${id}/gloss-preparation`, { method: 'POST' }),
   retry: (id: string) => request<{ status: string }>(`/api/papers/${id}/retry`, { method: 'POST' }),
   translateWord: (paperId: string, wordId: string) => request<WordGloss & { cached: boolean; elapsed_ms: number; context_count?: number; activity?: ActivityEvent[] }>(`/api/papers/${paperId}/translate-word`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },

@@ -4,7 +4,7 @@ import type { PDFDocumentProxy } from 'pdfjs-dist'
 import { api } from './api'
 import CitationGraph from './CitationGraph'
 import PdfReader from './PdfReader'
-import type { ActivityEvent, Answer, Paper, Source, VocabularyItem, Word, WordGloss } from './types'
+import type { ActivityEvent, Answer, GlossPreparation, Paper, Source, VocabularyItem, Word, WordGloss } from './types'
 
 pdfjs.GlobalWorkerOptions.workerSrc = new URL('pdfjs-dist/build/pdf.worker.mjs', import.meta.url).toString()
 
@@ -45,6 +45,9 @@ export default function App() {
   const [pdf, setPdf] = useState<PDFDocumentProxy | null>(null)
   const [fileName, setFileName] = useState('')
   const [pageIndex, setPageIndex] = useState(0)
+  const [glossPreparation, setGlossPreparation] = useState<GlossPreparation | null>(null)
+  const [skipPreparation, setSkipPreparation] = useState(false)
+  const [preparationAttempt, setPreparationAttempt] = useState(0)
   const [panel, setPanel] = useState<Panel>('assistant')
   const [gloss, setGloss] = useState<{ original: string; meaning: string; sentence: string; contextCount?: number; elapsedMs?: number } | null>(null)
   const [translated, setTranslated] = useState<Set<string>>(new Set())
@@ -79,7 +82,10 @@ export default function App() {
     let active = true
     const poll = () => {
       void api.paper(paperId).then((result) => {
-        if (active) setPaper(result)
+        if (active) setPaper((previous) => previous?.id === result.id ? {
+          ...result,
+          word_glosses: { ...previous.word_glosses, ...result.word_glosses },
+        } : result)
       }).catch((error: Error) => {
         if (active) setNotice(error.message)
       })
@@ -88,6 +94,31 @@ export default function App() {
     const timer = window.setInterval(poll, 2000)
     return () => { active = false; window.clearInterval(timer) }
   }, [paperId, paper?.status])
+
+  useEffect(() => {
+    if (!paperId) return
+    let active = true
+    let timer: number | undefined
+    const poll = () => {
+      void api.glossPreparation(paperId).then((result) => {
+        if (!active) return
+        setGlossPreparation(result)
+        setPaper((previous) => previous?.id === paperId ? {
+          ...previous,
+          word_glosses: { ...previous.word_glosses, ...result.word_glosses },
+        } : previous)
+        if (result.status === 'completed' || result.status === 'failed') window.clearInterval(timer)
+      }).catch((error: Error) => {
+        if (!active) return
+        window.clearInterval(timer)
+        setGlossPreparation({ status: 'failed', total: 0, ready: 0, failed: 0,
+          error: error.message, word_glosses: {} })
+      })
+    }
+    poll()
+    timer = window.setInterval(poll, 1500)
+    return () => { active = false; window.clearInterval(timer) }
+  }, [paperId, preparationAttempt])
 
   useEffect(() => {
     chatScroll.current?.scrollTo({ top: chatScroll.current.scrollHeight, behavior: 'smooth' })
@@ -124,6 +155,8 @@ export default function App() {
     setTurns([])
     setPanel('assistant')
     setPageIndex(0)
+    setGlossPreparation(null)
+    setSkipPreparation(false)
     try {
       if (file.size > 25 * 1024 * 1024) throw new Error('PDF는 25MB 이하로 업로드해 주세요.')
       const bytes = new Uint8Array(await file.arrayBuffer())
@@ -134,8 +167,22 @@ export default function App() {
       setPaperId(result.paper_id)
       setPaper(await api.paper(result.paper_id))
       if (result.cached) setNotice('이전에 분석한 논문을 불러왔습니다.')
-    } catch (error) { setNotice((error as Error).message) }
+    } catch (error) {
+      setPdf(null)
+      setPaper(null)
+      setPaperId(null)
+      setNotice((error as Error).message)
+    }
     finally { setUploading(false) }
+  }
+
+  async function retryPreparation() {
+    if (!paperId) return
+    try {
+      const result = await api.retryGlossPreparation(paperId)
+      setGlossPreparation(result)
+      setPreparationAttempt((previous) => previous + 1)
+    } catch (error) { setNotice((error as Error).message) }
   }
 
   function revealGloss(unit: WordGloss, word: Word, contextCount?: number, elapsedMs?: number) {
@@ -259,13 +306,15 @@ export default function App() {
   )
 
   const sourceCounts = countSources(paper?.sources || [])
+  const preparingGlosses = Boolean(pdf && !skipPreparation &&
+    (uploading || !paper || glossPreparation?.status !== 'completed'))
 
   return (
     <div className="app-shell">
       <header className="site-header">
         <Brand />
         <div className="header-right">
-          {paper?.status === 'ready' && <span className="header-state"><span className="status-dot" /> 읽을 준비가 됐어요</span>}
+          {paper?.status === 'ready' && !preparingGlosses && <span className="header-state"><span className="status-dot" /> 읽을 준비가 됐어요</span>}
           <span className="user-name">{user}</span>
           <button className="text-button" onClick={() => { void api.logout().then(() => { setUser(null); setPaper(null); setPaperId(null); setPdf(null); setFileName('') }) }}>로그아웃</button>
         </div>
@@ -296,6 +345,25 @@ export default function App() {
           <div className="welcome-footer"><span>READPAPER — RESEARCH, AT YOUR PACE</span><span>01 / YOUR READING SPACE</span></div>
           {notice && <div className="toast" role="status">{notice}<button onClick={() => setNotice('')} aria-label="닫기">×</button></div>}
         </main>
+      ) : preparingGlosses ? (
+        <main className="preparation-page" aria-live="polite">
+          <div className="preparation-card">
+            <p className="eyebrow">PREPARING YOUR PAPER</p>
+            <h1>{glossPreparation?.status === 'failed' ? '용어 준비가 멈췄습니다.' : '읽기 전에 용어를 준비하고 있어요.'}</h1>
+            <p className="preparation-title">{paper?.title || fileName}</p>
+            <div className="preparation-progress" role="progressbar" aria-label="주요 용어 준비" aria-valuemin={0}
+              aria-valuemax={glossPreparation?.total || 1} aria-valuenow={glossPreparation?.ready || 0}>
+              <span style={{ width: `${glossPreparation?.total ? glossPreparation.ready / glossPreparation.total * 100 : 0}%` }} />
+            </div>
+            <p className="preparation-count"><strong>{glossPreparation?.ready || 0}</strong> / {glossPreparation?.total ?? '…'}개 주요 용어 준비됨</p>
+            <p className="preparation-note">논문 전체에서 주요 용어를 고른 뒤 문맥에 맞는 뜻을 저장합니다. 나머지 단어는 읽다가 누르면 번역합니다.</p>
+            {glossPreparation?.status === 'failed' && <div className="preparation-actions">
+              <p>{glossPreparation.error || '로컬 모델 연결을 확인해 주세요.'}</p>
+              <button className="primary-button" onClick={() => { void retryPreparation() }}>다시 시도</button>
+              <button className="secondary-button" onClick={() => setSkipPreparation(true)}>원문 먼저 읽기</button>
+            </div>}
+          </div>
+        </main>
       ) : (
         <main className="workspace">
           <div className="paper-toolbar">
@@ -323,11 +391,11 @@ export default function App() {
                   <button disabled={pageIndex + 1 >= pdf.numPages} onClick={() => setPageIndex(Math.min(pdf.numPages - 1, pageIndex + 1))} aria-label="다음 페이지">›</button>
                 </div>
               </div>
-              <p className="reader-hint">단어를 누르면 논문 전체에서 관련 문맥을 찾아 단어·복합 용어의 뜻만 보여줍니다.{paper?.status !== 'ready' && <span> · 문헌 검색 중에도 원문을 읽고 용어 뜻을 볼 수 있어요.</span>}</p>
+              <p className="reader-hint">준비된 주요 용어는 누르면 바로 뜻이 보입니다. 다른 단어는 논문 문맥을 반영해 번역합니다.{glossPreparation?.failed ? <span> · {glossPreparation.failed}개 용어는 미리 준비되지 않았습니다.</span> : null}{paper?.status !== 'ready' && <span> · 문헌 검색은 계속 진행 중입니다.</span>}</p>
               <div className="pdf-stage">
                 <PdfReader
                   document={pdf} pageIndex={pageIndex} page={currentPage}
-                  wordGlosses={paper?.word_glosses || {}}
+                  wordGlosses={{ ...paper?.word_glosses, ...glossPreparation?.word_glosses }}
                   translated={translated} pendingWordIds={pendingWordIds}
                   onWord={toggleWord}
                 />
@@ -394,7 +462,7 @@ function AnalysisTimeline({ paper, paperId, uploading, onRetry }: { paper: Paper
   const counts = countSources(paper?.sources || [])
   return <section className={`analysis-timeline ${status === 'failed' ? 'analysis-timeline--failed' : ''}`} aria-label="논문 분석 진행">
     <div className="timeline-summary"><div className="timeline-title"><span className="timeline-symbol"><Icon name={status === 'ready' ? 'check' : 'network'} size={17} /></span><div><span className="timeline-kicker">PAPER PROCESS</span><strong>{status === 'ready' ? '논문을 읽을 수 있습니다' : status === 'failed' ? sourcesReady ? '문헌 수집 완료 · 문맥 준비 오류' : '문헌 분석을 마치지 못했습니다' : sourcesReady ? '문헌을 찾았습니다. 검색 문맥을 준비하고 있어요' : uploading && !paperId ? 'PDF를 읽을 준비 중입니다' : '인용·관련 연구를 찾고 있어요'}</strong></div></div>
-      <div className="timeline-detail">{sourcesReady ? <><b>{counts.references}</b>편 참고 <i>·</i> <b>{counts.citing}</b>편 피인용 <i>·</i> <b>{counts.related}</b>편 관련 자료{status === 'failed' && paper?.error ? <span> · {paper.error}</span> : null}</> : status === 'failed' ? paper?.error : '원문은 먼저 열리고, 용어 뜻은 누를 때 생성됩니다.'}</div>
+      <div className="timeline-detail">{sourcesReady ? <><b>{counts.references}</b>편 참고 <i>·</i> <b>{counts.citing}</b>편 피인용 <i>·</i> <b>{counts.related}</b>편 관련 자료{status === 'failed' && paper?.error ? <span> · {paper.error}</span> : null}</> : status === 'failed' ? paper?.error : '원문 문맥과 인용·관련 연구를 분석하고 있습니다.'}</div>
     </div>
     <div className="timeline-steps">{steps.map((label, index) => {
       const complete = index < completedSteps
@@ -431,7 +499,7 @@ function ResearchPanel({ title, sources, warnings, status, sourcesReady, error }
   return <div className="dock-panel research-panel" role="tabpanel">
     <div className="research-panel-heading"><p className="eyebrow">PAPER CONNECTIONS</p><h2>인용 지도</h2><p>논문 사이의 인용 관계를 한눈에 봅니다.</p></div>
     {!citationsReady ? <div className={`graph-wait ${status === 'failed' ? 'graph-wait--failed' : ''}`}><div className="graph-wait-mark"><Icon name="network" size={26} /></div><strong>{status === 'failed' ? '문헌 관계를 가져오지 못했습니다' : '관계를 찾고 있습니다'}</strong><p>{status === 'failed' ? error || '검색을 완료하지 못했습니다. 다시 시도해 주세요.' : '분석이 끝나면 참고문헌과 피인용 논문을 그래프로 보여드릴게요.'}</p></div> : <>
-      {status === 'processing' && <p className="collection-ready-note">문헌 검색이 끝나면 논문 문맥 검색을 준비합니다. 용어 뜻은 클릭할 때 생성됩니다.</p>}
+      {status === 'processing' && <p className="collection-ready-note">문헌 검색이 끝나면 논문 문맥 검색을 준비합니다.</p>}
       {status === 'failed' && error && <p className="source-warning">문헌 정보는 보존했습니다. 이후 분석 단계에서 오류가 발생했습니다: {error}</p>}
       <div className="graph-counts"><div><strong>{counts.references}</strong><span>찾은 참고문헌</span></div><div><strong>{counts.citing}</strong><span>찾은 피인용</span></div><div><strong>{counts.related}</strong><span>관련 연구 후보</span></div></div>
       <div className="citation-graph-card"><div className="graph-card-heading"><div><strong>직접 인용 관계</strong><span>화살표는 인용 방향을 나타냅니다</span></div><div className="graph-legend"><i className="legend-reference" />인용<i className="legend-citing" />피인용</div></div><CitationGraph title={title} sources={sources} /></div>

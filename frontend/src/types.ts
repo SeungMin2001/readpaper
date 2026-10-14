@@ -30,6 +30,15 @@ export type WordGloss = {
   sentence_id: string
 }
 
+export type GlossPreparation = {
+  status: 'pending' | 'queued' | 'running' | 'completed' | 'failed'
+  total: number
+  ready: number
+  failed: number
+  error: string | null
+  word_glosses: Record<string, WordGloss>
+}
+
 export type Source = {
   id: string
   kind: 'paper' | 'referenced' | 'related' | 'citing' | 'recent' | 'background'

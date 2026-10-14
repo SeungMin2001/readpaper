@@ -109,21 +109,19 @@ class VLLMClient:
         }
         request = {
             "paper_title": title,
-            "focus_index": focus_index,
-            "clicked_token": tokens[focus_index],
-            "tokens": tokens,
             "sentence": sentence,
+            "clicked_token": tokens[focus_index],
+            "before_clicked_token": tokens[max(0, focus_index - 3):focus_index],
+            "after_clicked_token": tokens[focus_index + 1:focus_index + 4],
             "other_passages_from_this_paper": [
                 passage for passage in paper_passages if passage != sentence
             ],
         }
         result = await self.chat_json(
-            "Give a short Korean gloss for the clicked scientific word. Use the paper title, "
-            "sentence, and other passages to choose its meaning. If the clicked token belongs "
-            "to a standard multiword technical term, select the smallest complete term; "
-            "otherwise select only the clicked token. Return term as an exact contiguous copy "
-            "of the English token or tokens, including the clicked token, and meaning as its "
-            "short Korean gloss. Do not return token indices or an explanation.",
+            "Return the exact English scientific term containing clicked_token and its short "
+            "Korean meaning as JSON with keys term and meaning. Include adjacent modifiers "
+            "when they form a compound term. Copy term from the sentence, and use the paper "
+            "context to choose its meaning. No explanation.",
             json.dumps(request, ensure_ascii=False),
             schema=schema,
             options={"temperature": 0, "num_predict": 96},
