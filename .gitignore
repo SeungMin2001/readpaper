@@ -11,3 +11,13 @@ frontend/dist/
 *.sqlite3-shm
 *.sqlite3-wal
 .DS_Store
+/data/runtime/*
+!/data/runtime/.gitkeep
+/data/inspection/*
+!/data/inspection/.gitkeep
+/data/papers/input/*
+!/data/papers/input/.gitkeep
+/data/papers/collected/*
+!/data/papers/collected/.gitkeep
+/data/chunks/*
+!/data/chunks/.gitkeep

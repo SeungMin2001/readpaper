@@ -1,5 +1,6 @@
 import os
 import asyncio
+import sys
 import tempfile
 import unittest
 from datetime import date
@@ -7,6 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 os.environ["READPAPER_DEV_MODE"] = "1"
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 import pymupdf as fitz  # noqa: E402
 import httpx  # noqa: E402
@@ -19,6 +21,7 @@ from readpaper.main import app  # noqa: E402
 from readpaper.pdf import extract_pdf  # noqa: E402
 from readpaper.rag import build_chunks, retrieve  # noqa: E402
 from readpaper.sources import collect_external_sources, reconstruct_abstract  # noqa: E402
+from fetch_open_access_fulltext import _extract_pdf_text, _title_match_score  # noqa: E402
 
 
 def example_pdf() -> bytes:
@@ -167,6 +170,61 @@ class ReadpaperFlowTests(unittest.TestCase):
         ]
         self.assertEqual(retrieve("robotic control", chunks)[0]["id"], "a")
 
+    def test_fulltext_pdf_is_checked_against_expected_paper_title(self):
+        document = fitz.open()
+        page = document.new_page()
+        page.insert_text((40, 60), "Generating Sequences With Recurrent Neural Networks")
+        text, page_count, _metadata_title, first_page = _extract_pdf_text(document.tobytes())
+        document.close()
+
+        self.assertEqual(page_count, 1)
+        self.assertIn("Generating Sequences", text)
+        self.assertGreaterEqual(
+            _title_match_score(
+                "Generating Sequences With Recurrent Neural Networks", "", first_page,
+            ),
+            0.6,
+        )
+        self.assertLess(
+            _title_match_score("HISTORIAE history of socio-cultural transformation", "", first_page),
+            0.6,
+        )
+
+    def test_reference_discovery_does_not_truncate_after_eight_works(self):
+        def work(work_id, title):
+            return {
+                "id": f"https://openalex.org/{work_id}", "display_name": title,
+                "abstract_inverted_index": {}, "authorships": [], "doi": None,
+            }
+
+        reference_ids = [f"https://openalex.org/W{index}" for index in range(1, 10)]
+
+        def respond(request):
+            if request.url.path.endswith("/works") and "search" in request.url.params:
+                return httpx.Response(200, json={"results": [{
+                    **work("W100", "A Paper With Nine References"),
+                    "referenced_works": reference_ids,
+                    "related_works": [],
+                }]})
+            if request.url.path.endswith("/works") and "openalex_id:" in request.url.params.get("filter", ""):
+                return httpx.Response(200, json={"results": [
+                    work(f"W{index}", f"Reference {index}") for index in range(1, 10)
+                ]})
+            return httpx.Response(200, json={"results": []})
+
+        client_class = httpx.AsyncClient
+        transport = httpx.MockTransport(respond)
+        with patch("readpaper.sources.httpx.AsyncClient", side_effect=lambda **kwargs: client_class(
+            transport=transport, **kwargs,
+        )):
+            sources, warnings = asyncio.run(collect_external_sources(
+                "A Paper With Nine References", None, [],
+            ))
+
+        self.assertEqual(len(sources), 9)
+        self.assertTrue(all(source["kind"] == "referenced" for source in sources))
+        self.assertFalse(warnings)
+
     def test_external_sources_are_labeled_and_title_matched(self):
         def work(work_id, title):
             return {
@@ -191,12 +249,12 @@ class ReadpaperFlowTests(unittest.TestCase):
                     "referenced_works": ["https://openalex.org/W2"],
                     "related_works": ["https://openalex.org/W3"],
                 }]})
+            if path.endswith("/works") and "openalex_id:" in request.url.params.get("filter", ""):
+                return httpx.Response(200, json={"results": [
+                    work("W2", "A referenced paper"), work("W3", "A related paper"),
+                ]})
             if path.endswith("/works"):
                 return httpx.Response(200, json={"results": [work("W4", "A citing paper")]})
-            if path.endswith("/works/W2"):
-                return httpx.Response(200, json=work("W2", "A referenced paper"))
-            if path.endswith("/works/W3"):
-                return httpx.Response(200, json=work("W3", "A related paper"))
             return httpx.Response(200, json={"query": {"pages": {"1": {
                 "title": "Language model", "extract": "Background knowledge.",
                 "fullurl": "https://en.wikipedia.org/wiki/Language_model",

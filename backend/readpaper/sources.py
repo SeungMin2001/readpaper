@@ -34,6 +34,47 @@ def _paper_source(work: dict[str, Any], kind: str, index: int) -> dict[str, Any]
     url = work.get("doi") or (work.get("primary_location") or {}).get("landing_page_url") or work.get("id")
     if not isinstance(url, str) or not url.startswith("https://"):
         url = None
+    open_access = work.get("open_access") or {}
+    oa_locations = list(work.get("locations") or [])
+    best_oa_location = work.get("best_oa_location")
+    if isinstance(best_oa_location, dict):
+        known_urls = {
+            location.get("pdf_url") for location in oa_locations if isinstance(location, dict)
+        }
+        if best_oa_location.get("pdf_url") not in known_urls:
+            oa_locations.append(best_oa_location)
+    open_access_locations = []
+    pdf_locations = []
+    seen_pdf_urls: set[str] = set()
+    seen_locations: set[tuple[str | None, str | None]] = set()
+    for location in oa_locations:
+        if not isinstance(location, dict) or not location.get("is_oa"):
+            continue
+        pdf_url = location.get("pdf_url")
+        landing_page_url = location.get("landing_page_url")
+        pdf_url = pdf_url if isinstance(pdf_url, str) and pdf_url.startswith("https://") else None
+        landing_page_url = (
+            landing_page_url if isinstance(landing_page_url, str)
+            and landing_page_url.startswith("https://") else None
+        )
+        location_key = (pdf_url, landing_page_url)
+        if location_key not in seen_locations:
+            seen_locations.add(location_key)
+            open_access_locations.append({
+                "pdf_url": pdf_url,
+                "landing_page_url": landing_page_url,
+                "license": location.get("license"),
+                "version": location.get("version"),
+            })
+        if not pdf_url or pdf_url in seen_pdf_urls:
+            continue
+        seen_pdf_urls.add(pdf_url)
+        pdf_locations.append({
+            "pdf_url": pdf_url,
+            "landing_page_url": landing_page_url,
+            "license": location.get("license"),
+            "version": location.get("version"),
+        })
     authors = [
         entry.get("author", {}).get("display_name", "")
         for entry in work.get("authorships", [])[:3] if isinstance(entry, dict)
@@ -44,6 +85,13 @@ def _paper_source(work: dict[str, Any], kind: str, index: int) -> dict[str, Any]
         "title": work["display_name"],
         "text": abstract, "content_scope": "abstract" if abstract else "metadata", "url": url,
         "year": work.get("publication_year"), "publication_date": work.get("publication_date"),
+        "is_oa": bool(
+            open_access.get("is_oa")
+            or (isinstance(best_oa_location, dict) and best_oa_location.get("is_oa"))
+        ),
+        "oa_status": open_access.get("oa_status"),
+        "open_access_locations": open_access_locations,
+        "pdf_locations": pdf_locations,
         "authors": [name for name in authors if name],
     }
 
@@ -83,24 +131,39 @@ async def collect_external_sources(title: str, doi: str | None, keywords: list[s
         if work:
             if isinstance(work.get("id"), str):
                 seen_works.add(work["id"])
-            references = [("referenced", work_id) for work_id in work.get("referenced_works", [])[:8]]
-            related = [("related", work_id) for work_id in work.get("related_works", [])[:4]]
+            # OpenAlex provides the complete reference list and up to 20 related works.
+            # Fetch the relation candidates in batches instead of silently truncating references.
+            relation_kinds: dict[str, str] = {}
+            relation_ids: list[str] = []
+            for kind, work_ids in (
+                ("referenced", work.get("referenced_works") or []),
+                ("related", (work.get("related_works") or [])[:20]),
+            ):
+                for work_id in work_ids:
+                    work_key = work_id.rsplit("/", 1)[-1] if isinstance(work_id, str) else ""
+                    if re.fullmatch(r"W\d+", work_key) and work_key not in relation_kinds:
+                        relation_kinds[work_key] = kind
+                        relation_ids.append(work_key)
 
-            async def fetch_work(kind: str, work_id: str) -> tuple[str, dict[str, Any] | None]:
-                work_key = work_id.rsplit("/", 1)[-1]
-                if not re.fullmatch(r"W\d+", work_key):
-                    return kind, None
+            for offset in range(0, len(relation_ids), 50):
+                batch = relation_ids[offset:offset + 50]
                 try:
-                    response = await client.get(f"{settings.openalex_url}/works/{work_key}")
+                    response = await client.get(f"{settings.openalex_url}/works", params={
+                        "filter": f"openalex_id:{'|'.join(batch)}", "per-page": len(batch),
+                    })
                     response.raise_for_status()
-                    return kind, response.json()
-                except (httpx.HTTPError, ValueError):
-                    return kind, None
-
-            results = await asyncio.gather(*(fetch_work(kind, work_id) for kind, work_id in references + related))
-            for kind, item in results:
-                if item:
-                    add_work(item, kind)
+                    batch_results = response.json().get("results", [])
+                    by_id = {
+                        item.get("id", "").rsplit("/", 1)[-1]: item
+                        for item in batch_results if isinstance(item.get("id"), str)
+                    }
+                    for work_key in batch:
+                        item = by_id.get(work_key)
+                        if item:
+                            add_work(item, relation_kinds[work_key])
+                except (httpx.HTTPError, ValueError, KeyError, TypeError):
+                    warnings.append("인용·관련 논문 일부의 서지 정보를 가져오지 못했습니다.")
+                    break
 
             try:
                 response = await client.get(
