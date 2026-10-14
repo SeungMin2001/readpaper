@@ -59,6 +59,7 @@ export type Paper = {
   sentences?: Sentence[]
   translations?: Record<string, SentenceTranslation>
   profile?: { summary: string; keywords: string[] }
+  sources_ready?: boolean
   sources?: Source[]
   source_warnings?: string[]
 }

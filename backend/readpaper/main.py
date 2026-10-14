@@ -144,24 +144,31 @@ async def process_paper(paper_id: str) -> None:
         return
     payload = paper["data"]
     try:
-        model = OllamaClient()
         db.set_paper(paper_id, status="processing", progress=3, error="")
-        profile = await model.profile(payload["title"], payload["full_text"])
-        payload["profile"] = profile
-        db.set_paper(paper_id, progress=8)
+        # Citation and related-work discovery is metadata work; make it available
+        # before relying on Ollama for profiling or translation.
         external, warnings = await collect_external_sources(
-            payload["title"], payload.get("doi"), profile["keywords"]
+            payload["title"], payload.get("doi"), []
         )
-        related_candidates = [
-            source for source in external if source.get("kind") in {"related", "recent"}
-        ]
-        selected_related = await model.select_related_papers(profile, related_candidates, limit=8)
-        external = [
-            source for source in external if source.get("kind") not in {"related", "recent"}
-        ] + selected_related
+        # OpenAlex returns related_works ordered by its own relevance signal.
+        # Use the first eight as an explicit, non-LLM baseline for this stage.
+        related_count = 0
+        discovered = []
+        for source in external:
+            if source.get("kind") == "related":
+                if related_count >= 8:
+                    continue
+                related_count += 1
+            discovered.append(source)
+        external = discovered
         payload["external_sources"] = external
         payload["source_warnings"] = warnings
-        db.set_paper(paper_id, progress=12)
+        db.set_paper(paper_id, progress=12, payload=payload)
+
+        model = OllamaClient()
+        profile = await model.profile(payload["title"], payload["full_text"])
+        payload["profile"] = profile
+        db.set_paper(paper_id, progress=18, payload=payload)
 
         words = {word["id"]: word for page in payload["pages"] for word in page["words"]}
         translations: dict[str, Any] = {}
@@ -185,7 +192,7 @@ async def process_paper(paper_id: str) -> None:
                 "translation": result["translation"], "units": units,
             }
             if index % 3 == 0 or index + 1 == len(sentences):
-                db.set_paper(paper_id, progress=12 + int(86 * (index + 1) / len(sentences)))
+                db.set_paper(paper_id, progress=18 + int(80 * (index + 1) / len(sentences)))
 
         payload["translations"] = translations
         payload["chunks"] = build_chunks(sentences, external, payload["title"])
@@ -234,16 +241,21 @@ def get_paper(paper_id: str, _user: str = Depends(require_user)) -> dict[str, An
         "id": paper_id, "title": paper["title"], "status": paper["status"],
         "progress": paper["progress"], "error": paper["error"],
     }
-    if paper["status"] == "ready":
-        data = paper["data"]
+    data = paper["data"]
+    sources_ready = "external_sources" in data
+    response["sources_ready"] = sources_ready
+    if sources_ready:
         response.update({
-            "pages": data["pages"], "sentences": data["sentences"],
-            "translations": data["translations"], "profile": data["profile"],
             "sources": [
                 {key: value for key, value in source.items() if key != "text"}
                 for source in data["external_sources"]
             ],
-            "source_warnings": data["source_warnings"],
+            "source_warnings": data.get("source_warnings", []),
+        })
+    if paper["status"] == "ready":
+        response.update({
+            "pages": data["pages"], "sentences": data["sentences"],
+            "translations": data["translations"], "profile": data["profile"],
         })
     return response
 

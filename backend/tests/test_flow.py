@@ -16,7 +16,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from readpaper import db  # noqa: E402
 from readpaper.config import Settings  # noqa: E402
-from readpaper.llm import InvalidModelOutput, validate_translation  # noqa: E402
+from readpaper.llm import InvalidModelOutput, ModelUnavailable, validate_translation  # noqa: E402
 from readpaper.main import app  # noqa: E402
 from readpaper.pdf import extract_pdf  # noqa: E402
 from readpaper.rag import build_chunks, retrieve  # noqa: E402
@@ -152,6 +152,28 @@ class ReadpaperFlowTests(unittest.TestCase):
                     db.cleanup_expired()
                     self.assertEqual(client.get(f"/api/papers/{paper_id}").status_code, 404)
                     self.assertEqual(len(client.get("/api/vocabulary").json()), 1)
+
+    def test_discovered_sources_are_visible_if_local_model_is_unavailable(self):
+        class OfflineOllama:
+            async def profile(self, title, full_text):
+                raise ModelUnavailable("Mac mini Ollama is offline")
+
+        with tempfile.TemporaryDirectory() as directory:
+            config = Settings(data_dir=Path(directory), dev_mode=True)
+            with patch("readpaper.db.settings", config), patch("readpaper.main.settings", config), \
+                    patch("readpaper.main.OllamaClient", OfflineOllama), \
+                    patch("readpaper.main.collect_external_sources", fake_sources):
+                with TestClient(app) as client:
+                    upload = client.post(
+                        "/api/papers/upload",
+                        files={"file": ("sample.pdf", example_pdf(), "application/pdf")},
+                    )
+                    self.assertEqual(upload.status_code, 200, upload.text)
+
+                    paper = client.get(f"/api/papers/{upload.json()['paper_id']}").json()
+                    self.assertEqual(paper["status"], "failed")
+                    self.assertTrue(paper["sources_ready"])
+                    self.assertEqual([source["title"] for source in paper["sources"]], ["A related study"])
 
     def test_invalid_gloss_alignment_rejected(self):
         with self.assertRaises(InvalidModelOutput):

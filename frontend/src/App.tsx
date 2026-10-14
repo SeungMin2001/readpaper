@@ -338,7 +338,7 @@ export default function App() {
                 </form>
               </section>}
 
-              {panel === 'research' && <ResearchPanel title={paper?.title || fileName} sources={paper?.sources || []} warnings={paper?.source_warnings || []} status={paper?.status || (uploading ? 'processing' : 'processing')} />}
+              {panel === 'research' && <ResearchPanel title={paper?.title || fileName} sources={paper?.sources || []} warnings={paper?.source_warnings || []} status={paper?.status || 'processing'} sourcesReady={Boolean(paper?.sources_ready)} error={paper?.error || undefined} />}
               {panel === 'vocabulary' && <div className="dock-panel vocabulary-panel" role="tabpanel"><div className="panel-title-row"><div><p className="eyebrow">YOUR READING NOTES</p><h2>나의 단어장 <span className="count">{vocabulary.length}</span></h2></div></div><p className="panel-copy">논문을 읽으며 확인한 단어가 모입니다.</p><form className="manual-form" onSubmit={saveManual}><input value={manualTerm} onChange={(event) => setManualTerm(event.target.value)} placeholder="단어" required /><input value={manualMeaning} onChange={(event) => setManualMeaning(event.target.value)} placeholder="뜻" required /><button className="secondary-button" type="submit">추가</button></form><div className="vocab-list">{vocabulary.map((item) => <article className="vocab-item" key={item.id}><div><strong>{item.term}</strong><span>{item.meaning}</span></div>{item.source_sentence && <p>{item.source_sentence}</p>}<small>{item.paper_title}</small><button aria-label={`${item.term} 삭제`} onClick={() => { void api.deleteWord(item.id).then(refreshVocabulary).catch((error: Error) => setNotice(error.message)) }}>×</button></article>)}{vocabulary.length === 0 && <div className="empty-research"><span><Icon name="words" size={24} /></span><p>논문에서 모르는 단어를 눌러보세요.</p></div>}</div></div>}
             </aside>
           </div>
@@ -359,38 +359,41 @@ function countSources(sources: Source[]) {
 
 function AnalysisTimeline({ paper, paperId, uploading, onRetry }: { paper: Paper | null; paperId: string | null; uploading: boolean; onRetry: () => void }) {
   const status = paper?.status
-  const progress = paper?.progress || 0
-  const activeStep = status === 'ready' ? 3 : progress < 8 ? 0 : progress < 12 ? 1 : 2
+  const sourcesReady = Boolean(paper?.sources_ready)
+  const completedSteps = status === 'ready' ? 3 : sourcesReady ? 2 : paperId ? 1 : 0
   const steps = ['논문 구조 읽기', '인용·관련 연구 찾기', '문장별 번역 준비']
   const counts = countSources(paper?.sources || [])
   return <section className={`analysis-timeline ${status === 'failed' ? 'analysis-timeline--failed' : ''}`} aria-label="논문 분석 진행">
-    <div className="timeline-summary"><div className="timeline-title"><span className="timeline-symbol"><Icon name={status === 'ready' ? 'check' : 'network'} size={17} /></span><div><span className="timeline-kicker">PAPER PROCESS</span><strong>{status === 'ready' ? '분석이 끝났습니다' : status === 'failed' ? '분석을 마치지 못했습니다' : uploading && !paperId ? 'PDF를 읽을 준비 중입니다' : '논문을 차례로 살펴보고 있어요'}</strong></div></div>
-      <div className="timeline-detail">{status === 'ready' ? <><b>{counts.references}</b>편 참고 <i>·</i> <b>{counts.citing}</b>편 피인용 <i>·</i> <b>{counts.related}</b>편 관련 자료</> : status === 'failed' ? paper?.error : '원문을 먼저 열었습니다. 분석이 진행되는 동안에도 읽을 수 있어요.'}</div>
+    <div className="timeline-summary"><div className="timeline-title"><span className="timeline-symbol"><Icon name={status === 'ready' ? 'check' : 'network'} size={17} /></span><div><span className="timeline-kicker">PAPER PROCESS</span><strong>{status === 'ready' ? '분석이 끝났습니다' : status === 'failed' ? sourcesReady ? '문헌 수집 완료 · 후속 분석에 오류' : '분석을 마치지 못했습니다' : sourcesReady ? '문헌을 찾았습니다. 번역을 준비하고 있어요' : uploading && !paperId ? 'PDF를 읽을 준비 중입니다' : '인용·관련 연구를 찾고 있어요'}</strong></div></div>
+      <div className="timeline-detail">{sourcesReady ? <><b>{counts.references}</b>편 참고 <i>·</i> <b>{counts.citing}</b>편 피인용 <i>·</i> <b>{counts.related}</b>편 관련 자료{status === 'failed' && paper?.error ? <span> · {paper.error}</span> : null}</> : status === 'failed' ? paper?.error : '원문을 먼저 열었습니다. 분석이 진행되는 동안에도 읽을 수 있어요.'}</div>
     </div>
     <div className="timeline-steps">{steps.map((label, index) => {
-      const complete = activeStep > index
-      const active = activeStep === index && status !== 'failed'
-      return <div className={`timeline-step ${complete ? 'complete' : ''} ${active ? 'active' : ''}`} key={label}><span className="timeline-step-marker">{complete ? <Icon name="check" size={13} /> : String(index + 1).padStart(2, '0')}</span><div className="timeline-step-copy"><strong>{label}</strong><span>{index === 0 ? '제목과 문장 구조' : index === 1 ? '참고문헌과 연구 관계' : '원문 문맥을 반영'}</span></div></div>
+      const complete = index < completedSteps
+      const failed = status === 'failed' && index === completedSteps
+      const active = status !== 'failed' && index === completedSteps
+      return <div className={`timeline-step ${complete ? 'complete' : ''} ${active ? 'active' : ''} ${failed ? 'failed' : ''}`} key={label}><span className="timeline-step-marker">{complete ? <Icon name="check" size={13} /> : failed ? '!' : String(index + 1).padStart(2, '0')}</span><div className="timeline-step-copy"><strong>{label}</strong><span>{index === 0 ? '제목과 문장 구조' : index === 1 ? 'OpenAlex 관계 정보' : '원문 문맥을 반영'}</span></div></div>
     })}</div>
     {status === 'failed' && paperId && <button className="retry-button" onClick={onRetry}>다시 시도</button>}
   </section>
 }
 
-function ResearchPanel({ title, sources, warnings, status }: { title: string; sources: Source[]; warnings: string[]; status: Paper['status'] }) {
+function ResearchPanel({ title, sources, warnings, status, sourcesReady, error }: { title: string; sources: Source[]; warnings: string[]; status: Paper['status']; sourcesReady: boolean; error?: string }) {
   const [query, setQuery] = useState('')
   const counts = countSources(sources)
-  const citationsReady = status === 'ready'
+  const citationsReady = sourcesReady || status === 'ready'
   const related = sources.filter((source) => source.kind === 'related' || source.kind === 'recent')
   const searchable = sources.filter((source) => source.kind !== 'background')
   const filtered = searchable.filter((source) => `${source.title} ${(source.authors || []).join(' ')}`.toLowerCase().includes(query.toLowerCase()))
   return <div className="dock-panel research-panel" role="tabpanel">
     <div className="research-panel-heading"><p className="eyebrow">PAPER CONNECTIONS</p><h2>인용 지도</h2><p>논문 사이의 인용 관계를 한눈에 봅니다.</p></div>
-    {!citationsReady ? <div className="graph-wait"><div className="graph-wait-mark"><Icon name="network" size={26} /></div><strong>관계를 찾고 있습니다</strong><p>분석이 끝나면 참고문헌과 피인용 논문을 그래프로 보여드릴게요.</p></div> : <>
+    {!citationsReady ? <div className={`graph-wait ${status === 'failed' ? 'graph-wait--failed' : ''}`}><div className="graph-wait-mark"><Icon name="network" size={26} /></div><strong>{status === 'failed' ? '문헌 관계를 가져오지 못했습니다' : '관계를 찾고 있습니다'}</strong><p>{status === 'failed' ? error || '검색을 완료하지 못했습니다. 다시 시도해 주세요.' : '분석이 끝나면 참고문헌과 피인용 논문을 그래프로 보여드릴게요.'}</p></div> : <>
+      {status === 'processing' && <p className="collection-ready-note">문헌 검색은 끝났습니다. 번역은 별도로 계속 진행 중입니다.</p>}
+      {status === 'failed' && error && <p className="source-warning">문헌 정보는 보존했습니다. 이후 분석 단계에서 오류가 발생했습니다: {error}</p>}
       <div className="graph-counts"><div><strong>{counts.references}</strong><span>찾은 참고문헌</span></div><div><strong>{counts.citing}</strong><span>찾은 피인용</span></div><div><strong>{counts.related}</strong><span>관련 연구 후보</span></div></div>
       <div className="citation-graph-card"><div className="graph-card-heading"><div><strong>직접 인용 관계</strong><span>화살표는 인용 방향을 나타냅니다</span></div><div className="graph-legend"><i className="legend-reference" />인용<i className="legend-citing" />피인용</div></div><CitationGraph title={title} sources={sources} /></div>
       <div className="research-results-heading"><div><p className="eyebrow">DISCOVERED PAPERS</p><h3>찾은 연구 <span>{searchable.length}</span></h3></div><label className="source-search"><Icon name="search" size={15} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="제목으로 검색" /></label></div>
       {warnings.map((warning) => <p className="source-warning" key={warning}>{warning}</p>)}
-      {related.length > 0 && <div className="related-note"><strong>관련 연구 후보</strong><span>인용 기록이 확인된 연결만 그래프에 표시합니다.</span></div>}
+      {related.length > 0 && <div className="related-note"><strong>관련 연구 후보</strong><span>OpenAlex의 관련도 순서에서 최대 8편을 표시합니다. 인용 기록이 확인된 연결만 그래프에 표시합니다.</span></div>}
       <div className="source-list">{filtered.map((source) => <SourceCard key={source.id} source={source} compact />)}{filtered.length === 0 && <p className="empty-note">검색 결과가 없습니다.</p>}</div>
       <p className="source-footnote">자료마다 초록 또는 서지 정보만 제공될 수 있습니다. 전문 수집 여부는 별도로 확인하세요.</p>
     </>}

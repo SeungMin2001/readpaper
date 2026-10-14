@@ -119,6 +119,8 @@ a { color: inherit; }
 .timeline-step.active .timeline-step-copy strong { color: #47664c; }
 .timeline-step.complete .timeline-step-marker { border-color: #648263; background: #638264; color: #fff; }
 .timeline-step.complete .timeline-step-copy strong { color: #667e68; }
+.timeline-step.failed .timeline-step-marker { border-color: #c99566; background: #faf3e9; color: #9b6849; }
+.timeline-step.failed .timeline-step-copy strong { color: #9b6849; }
 .analysis-timeline--failed .timeline-symbol { background: #f7ebe4; color: #9a644d; }
 .retry-button { position: absolute; right: 18px; bottom: 12px; padding: 3px 8px; border: 1px solid #d6ddd2; border-radius: 3px; background: #fff; color: #506c55; font-size: 9px; }
 
@@ -258,6 +260,9 @@ a { color: inherit; }
 .graph-wait-mark { width: 52px; height: 52px; margin-bottom: 13px; display: grid; place-items: center; border: 1px solid #e0e5dc; border-radius: 50%; color: #719072; }
 .graph-wait strong { color: #596e5c; font-size: 11px; font-weight: 600; }
 .graph-wait p { max-width: 230px; margin: 7px 0; color: #9aa39a; font-size: 9px; line-height: 1.6; }
+.graph-wait--failed .graph-wait-mark { border-color: #ead9cb; color: #a36e50; }
+.graph-wait--failed strong { color: #8e624b; }
+.collection-ready-note { margin: 0 0 12px; padding: 8px 9px; border-left: 2px solid #779278; background: #f0f4ec; color: #627763; font-size: 8px; line-height: 1.5; }
 .research-results-heading { margin: 18px 0 9px; display: flex; align-items: end; justify-content: space-between; gap: 8px; }
 .research-results-heading .eyebrow { margin: 0 0 2px; font-size: 7px; }
 .research-results-heading h3 { margin: 0; color: #394e3e; font-family: 'DM Serif Display', 'Noto Sans KR', serif; font-size: 17px; font-weight: 400; }
