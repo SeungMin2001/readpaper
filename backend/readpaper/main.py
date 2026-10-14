@@ -2,6 +2,7 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import re
 import time
 import uuid
 from pathlib import Path
@@ -21,8 +22,7 @@ from .sources import collect_external_sources
 
 app = FastAPI(title="Readpaper API", version="0.1.0")
 
-TRANSLATION_BATCH_SIZE = 3
-TRANSLATION_BATCH_MAX_WORDS = 96
+_ollama_lock = asyncio.Lock()
 
 
 class LoginRequest(BaseModel):
@@ -32,6 +32,10 @@ class LoginRequest(BaseModel):
 
 class QuestionRequest(BaseModel):
     question: str = Field(min_length=3, max_length=1000)
+
+
+class WordTranslationRequest(BaseModel):
+    word_id: str = Field(min_length=1, max_length=40)
 
 
 class VocabularyRequest(BaseModel):
@@ -78,26 +82,39 @@ def require_user(request: Request) -> str:
     return settings.username
 
 
-def _translation_batches(sentences: list[dict[str, Any]], words: dict[str, dict[str, Any]]):
-    batch: list[tuple[int, dict[str, Any], list[str]]] = []
-    batch_words = 0
+def _word_context(sentences: list[dict[str, Any]], word: str, sentence_id: str,
+                  chunks: list[dict[str, Any]]) -> list[str]:
+    """Gather compact evidence from the clicked sentence and the full paper."""
+    selected = next((index for index, item in enumerate(sentences) if item["id"] == sentence_id), None)
+    if selected is None:
+        return []
+
+    contexts = [sentences[selected]["text"]]
+    normalized = re.sub(r"^\W+|\W+$", "", word).casefold()
+    matches = []
     for index, sentence in enumerate(sentences):
-        tokens = [words[word_id]["text"] for word_id in sentence["word_ids"]]
-        if batch and (
-            len(batch) >= TRANSLATION_BATCH_SIZE
-            or batch_words + len(tokens) > TRANSLATION_BATCH_MAX_WORDS
-        ):
-            yield batch
-            batch = []
-            batch_words = 0
-        batch.append((index, sentence, tokens))
-        batch_words += len(tokens)
-        if batch_words >= TRANSLATION_BATCH_MAX_WORDS:
-            yield batch
-            batch = []
-            batch_words = 0
-    if batch:
-        yield batch
+        if index == selected:
+            continue
+        if any(re.sub(r"^\W+|\W+$", "", token).casefold() == normalized
+               for token in sentence["text"].split()):
+            matches.append(index)
+
+    # Spread repeated occurrences across the paper to preserve document-level sense.
+    if len(matches) > 3:
+        matches = [matches[round(offset * (len(matches) - 1) / 2)] for offset in range(3)]
+    contexts.extend(sentences[index]["text"] for index in matches)
+
+    # Add a few lexically related passages when the term appears only once.
+    if len(contexts) < 4:
+        paper_chunks = [chunk for chunk in chunks if chunk.get("kind") == "paper"]
+        related = retrieve(f"{word} {sentences[selected]['text']}", paper_chunks, limit=5)
+        for item in related:
+            excerpt = item.get("text", "")
+            if excerpt and excerpt not in contexts:
+                contexts.append(excerpt)
+            if len(contexts) == 4:
+                break
+    return [context[:900] for context in contexts[:4]]
 
 
 _cleanup_task: asyncio.Task[None] | None = None
@@ -180,8 +197,7 @@ async def process_paper(paper_id: str) -> None:
         async def report_collection_event(message: str, state: str = "info") -> None:
             db.add_paper_activity(paper_id, message, state)
 
-        # Citation and related-work discovery is metadata work; make it available
-        # before relying on Ollama for profiling or translation.
+        # Paper reading and local RAG preparation must not depend on an LLM call.
         external, warnings = await collect_external_sources(
             payload["title"], payload.get("doi"), [], on_event=report_collection_event,
         )
@@ -196,9 +212,10 @@ async def process_paper(paper_id: str) -> None:
                 related_count += 1
             discovered.append(source)
         external = discovered
-        payload["external_sources"] = external
-        payload["source_warnings"] = warnings
-        db.set_paper(paper_id, progress=12, payload=payload)
+        db.merge_paper_data(paper_id, {
+            "external_sources": external,
+            "source_warnings": warnings,
+        })
         source_counts = {
             kind: sum(source.get("kind") == kind for source in external)
             for kind in ("referenced", "related", "citing")
@@ -211,61 +228,11 @@ async def process_paper(paper_id: str) -> None:
         for warning in warnings:
             db.add_paper_activity(paper_id, warning, "warning")
 
-        db.add_paper_activity(paper_id, "Mac mini Ollama로 논문 맥락을 분석하는 중")
-        model = OllamaClient()
-        profile = await model.profile(payload["title"], payload["full_text"])
-        payload["profile"] = profile
-        db.set_paper(paper_id, progress=18, payload=payload)
-        db.add_paper_activity(paper_id, "논문 맥락과 핵심 주제 분석 완료", "success")
-
-        words = {word["id"]: word for page in payload["pages"] for word in page["words"]}
-        translations: dict[str, Any] = {}
-        sentences = payload["sentences"]
-        db.add_paper_activity(paper_id, f"문장 번역 시작: {len(sentences)}문장")
-        translated_count = 0
-        for batch in _translation_batches(sentences, words):
-            batch_started = time.monotonic()
-            requests = []
-            for index, sentence, tokens in batch:
-                requests.append({
-                    "id": sentence["id"], "sentence": sentence["text"], "tokens": tokens,
-                    "previous_sentence": sentences[index - 1]["text"] if index else "",
-                    "following_sentence": (
-                        sentences[index + 1]["text"] if index + 1 < len(sentences) else ""
-                    ),
-                })
-            results = await model.translate_sentences(requests, profile)
-            for _index, sentence, _tokens in batch:
-                result = results[sentence["id"]]
-                units = []
-                for unit in result["units"]:
-                    unit_word_ids = sentence["word_ids"][unit["start"]:unit["end"]]
-                    units.append({
-                        "word_ids": unit_word_ids,
-                        "original": " ".join(words[word_id]["text"] for word_id in unit_word_ids),
-                        "meaning": unit["meaning"],
-                    })
-                translations[sentence["id"]] = {
-                    "translation": result["translation"], "units": units,
-                }
-            translated_count += len(batch)
-            elapsed = time.monotonic() - batch_started
-            db.set_paper(
-                paper_id, progress=18 + int(80 * translated_count / len(sentences)),
-            )
-            db.add_paper_activity(
-                paper_id,
-                f"문장 번역 진행: {translated_count}/{len(sentences)} · 묶음 {len(batch)}문장 "
-                f"{elapsed:.1f}초",
-            )
-
-        payload["translations"] = translations
-        payload["chunks"] = build_chunks(sentences, external, payload["title"])
-        db.set_paper(paper_id, payload=payload, status="ready", progress=100, error="")
-        db.add_paper_activity(paper_id, "논문 분석과 번역이 완료됐습니다", "success")
-    except (ModelUnavailable, InvalidModelOutput) as exc:
-        db.set_paper(paper_id, status="failed", error=str(exc))
-        db.add_paper_activity(paper_id, str(exc), "error")
+        db.set_paper(paper_id, progress=75)
+        chunks = build_chunks(payload["sentences"], external, payload["title"])
+        db.merge_paper_data(paper_id, {"chunks": chunks})
+        db.set_paper(paper_id, status="ready", progress=100, error="")
+        db.add_paper_activity(paper_id, "원문·문헌·검색 문맥 준비 완료. 용어 뜻은 클릭할 때 생성합니다.", "success")
     except Exception:
         db.set_paper(paper_id, status="failed", error="논문 분석 중 오류가 발생했습니다. 서버 로그를 확인하세요.")
         db.add_paper_activity(paper_id, "분석 중 예기치 못한 오류가 발생했습니다", "error")
@@ -321,11 +288,10 @@ def get_paper(paper_id: str, _user: str = Depends(require_user)) -> dict[str, An
             ],
             "source_warnings": data.get("source_warnings", []),
         })
-    if paper["status"] == "ready":
-        response.update({
-            "pages": data["pages"], "sentences": data["sentences"],
-            "translations": data["translations"], "profile": data["profile"],
-        })
+    response.update({
+        "pages": data["pages"], "sentences": data["sentences"],
+        "word_glosses": data.get("word_glosses", {}),
+    })
     return response
 
 
@@ -342,6 +308,83 @@ def retry_paper(paper_id: str, background: BackgroundTasks,
     return {"status": "processing"}
 
 
+@app.post("/api/papers/{paper_id}/translate-word")
+async def translate_word(paper_id: str, body: WordTranslationRequest,
+                         _user: str = Depends(require_user)) -> dict[str, Any]:
+    paper = db.get_paper(paper_id)
+    if paper is None:
+        raise HTTPException(status_code=404, detail="논문을 찾을 수 없습니다.")
+    data = paper["data"]
+    known_words = {
+        word["id"]: word for page in data.get("pages", []) for word in page.get("words", [])
+    }
+    word = known_words.get(body.word_id)
+    if word is None:
+        raise HTTPException(status_code=404, detail="선택한 단어를 논문에서 찾을 수 없습니다.")
+
+    cached = data.get("word_glosses", {}).get(body.word_id)
+    if cached:
+        return cached | {
+            "cached": True, "elapsed_ms": 0,
+            "activity": db.list_paper_activity(paper_id),
+        }
+
+    sentences = data.get("sentences", [])
+    sentence_index = next(
+        (index for index, item in enumerate(sentences) if item["id"] == word["sentence_id"]), None,
+    )
+    if sentence_index is None:
+        raise HTTPException(status_code=422, detail="단어가 속한 문장을 찾을 수 없습니다.")
+    sentence = sentences[sentence_index]
+    tokens = [known_words[word_id]["text"] for word_id in sentence["word_ids"]]
+    focus_index = sentence["word_ids"].index(body.word_id)
+    passages = _word_context(sentences, word["text"], sentence["id"], data.get("chunks", []))
+
+    started = time.monotonic()
+    async with _ollama_lock:
+        # Another click may have completed while this request waited for the local model.
+        latest = db.get_paper(paper_id, touch=False)
+        cached = (latest or {}).get("data", {}).get("word_glosses", {}).get(body.word_id)
+        if cached:
+            return cached | {
+                "cached": True, "elapsed_ms": 0,
+                "activity": db.list_paper_activity(paper_id),
+            }
+        model = OllamaClient()
+        try:
+            result = await model.translate_keyword(
+                data["title"], sentence["text"], tokens, focus_index, passages,
+            )
+        except (ModelUnavailable, InvalidModelOutput) as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+        start, end = result.get("start"), result.get("end")
+        meaning = result.get("meaning")
+        if (type(start) is not int or type(end) is not int or start < 0 or end <= start
+                or end > len(tokens) or not start <= focus_index < end
+                or not isinstance(meaning, str) or not meaning.strip() or len(meaning) > 100):
+            raise HTTPException(status_code=502, detail="용어 번역 결과를 검증할 수 없습니다.")
+
+        word_ids = sentence["word_ids"][start:end]
+        clean_term = [re.sub(r"^[\W_]+|[\W_]+$", "", token) for token in tokens[start:end]]
+        unit = {
+            "word_ids": word_ids,
+            "original": " ".join(token for token in clean_term if token),
+            "meaning": meaning.strip(),
+            "sentence_id": sentence["id"],
+        }
+        db.save_word_gloss(paper_id, word_ids, unit)
+
+    elapsed_ms = round((time.monotonic() - started) * 1000)
+    db.add_paper_activity(
+        paper_id, f"용어 뜻 생성: {unit['original']} · {elapsed_ms / 1000:.1f}초", "success",
+    )
+    return unit | {
+        "cached": False, "elapsed_ms": elapsed_ms, "context_count": len(passages),
+        "activity": db.list_paper_activity(paper_id),
+    }
+
+
 @app.post("/api/papers/{paper_id}/ask")
 async def ask_paper(paper_id: str, body: QuestionRequest,
                     _user: str = Depends(require_user)) -> dict[str, Any]:
@@ -350,11 +393,12 @@ async def ask_paper(paper_id: str, body: QuestionRequest,
         raise HTTPException(status_code=404, detail="읽을 준비가 된 논문이 없습니다.")
     model = OllamaClient()
     try:
-        english_query = await model.search_query(body.question)
-        contexts = retrieve(english_query, paper["data"]["chunks"])
-        if not contexts:
-            return {"answer": "수집한 자료에서 이 질문의 근거를 찾지 못했습니다.", "citations": [], "sources": []}
-        result = await model.answer(body.question, contexts)
+        async with _ollama_lock:
+            english_query = await model.search_query(body.question)
+            contexts = retrieve(english_query, paper["data"]["chunks"])
+            if not contexts:
+                return {"answer": "수집한 자료에서 이 질문의 근거를 찾지 못했습니다.", "citations": [], "sources": []}
+            result = await model.answer(body.question, contexts)
         selected = [
             {key: value for key, value in source.items() if key != "text"}
             | {"excerpt": source["text"][:350]}

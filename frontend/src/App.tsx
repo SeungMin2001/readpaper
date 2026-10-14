@@ -4,7 +4,7 @@ import type { PDFDocumentProxy } from 'pdfjs-dist'
 import { api } from './api'
 import CitationGraph from './CitationGraph'
 import PdfReader from './PdfReader'
-import type { ActivityEvent, Answer, Paper, Source, TranslationUnit, VocabularyItem, Word } from './types'
+import type { ActivityEvent, Answer, Paper, Source, VocabularyItem, Word, WordGloss } from './types'
 
 pdfjs.GlobalWorkerOptions.workerSrc = new URL('pdfjs-dist/build/pdf.worker.mjs', import.meta.url).toString()
 
@@ -46,10 +46,9 @@ export default function App() {
   const [fileName, setFileName] = useState('')
   const [pageIndex, setPageIndex] = useState(0)
   const [panel, setPanel] = useState<Panel>('assistant')
-  const [mode, setMode] = useState<'word' | 'sentence'>('word')
-  const [selectedSentence, setSelectedSentence] = useState<string | null>(null)
-  const [gloss, setGloss] = useState<{ original: string; meaning: string; sentence: string } | null>(null)
+  const [gloss, setGloss] = useState<{ original: string; meaning: string; sentence: string; contextCount?: number; elapsedMs?: number } | null>(null)
   const [translated, setTranslated] = useState<Set<string>>(new Set())
+  const [pendingWordIds, setPendingWordIds] = useState<Set<string>>(new Set())
   const [vocabulary, setVocabulary] = useState<VocabularyItem[]>([])
   const [question, setQuestion] = useState('')
   const [turns, setTurns] = useState<ChatTurn[]>([])
@@ -61,6 +60,7 @@ export default function App() {
   const [manualMeaning, setManualMeaning] = useState('')
   const fileInput = useRef<HTMLInputElement>(null)
   const chatScroll = useRef<HTMLDivElement>(null)
+  const wordRequests = useRef(new Map<string, Promise<WordGloss>>())
 
   useEffect(() => {
     api.me().then((result) => setUser(result.username)).catch(() => setUser(null))
@@ -97,8 +97,6 @@ export default function App() {
     () => new Map((paper?.sentences || []).map((sentence) => [sentence.id, sentence])),
     [paper?.sentences],
   )
-  const currentSentence = selectedSentence ? sentenceMap.get(selectedSentence) : undefined
-  const currentTranslation = currentSentence ? paper?.translations?.[currentSentence.id]?.translation : undefined
   const currentPage = paper?.pages?.[pageIndex]
   const canAsk = Boolean(paperId && paper?.status === 'ready')
 
@@ -120,7 +118,8 @@ export default function App() {
     setPaper(null)
     setPaperId(null)
     setTranslated(new Set())
-    setSelectedSentence(null)
+    setPendingWordIds(new Set())
+    wordRequests.current.clear()
     setGloss(null)
     setTurns([])
     setPanel('assistant')
@@ -139,12 +138,8 @@ export default function App() {
     finally { setUploading(false) }
   }
 
-  function chooseSentence(id: string) {
-    setSelectedSentence(id)
-    setPanel('assistant')
-  }
-
-  function toggleWord(key: string, unit: TranslationUnit, word: Word) {
+  function revealGloss(unit: WordGloss, word: Word, contextCount?: number, elapsedMs?: number) {
+    const key = unit.word_ids.join(':')
     const wasTranslated = translated.has(key)
     setTranslated((previous) => {
       const next = new Set(previous)
@@ -156,8 +151,8 @@ export default function App() {
       setGloss(null)
       return
     }
-    const sentence = sentenceMap.get(word.sentence_id)
-    setGloss({ original: unit.original, meaning: unit.meaning, sentence: sentence?.text || '' })
+    const sentence = sentenceMap.get(unit.sentence_id || word.sentence_id)
+    setGloss({ original: unit.original, meaning: unit.meaning, sentence: sentence?.text || '', contextCount, elapsedMs })
     setPanel('assistant')
     if (paper) {
       void api.saveWord({
@@ -165,6 +160,44 @@ export default function App() {
         meaning: unit.meaning, source_sentence: sentence?.text || '',
       }).then(refreshVocabulary).catch((error: Error) => setNotice(`단어 저장 실패: ${error.message}`))
     }
+  }
+
+  function toggleWord(word: Word, cached?: WordGloss) {
+    if (cached) {
+      revealGloss(cached, word)
+      return
+    }
+    if (!paperId || wordRequests.current.has(word.id)) return
+
+    setPendingWordIds((previous) => new Set(previous).add(word.id))
+    const request = api.translateWord(paperId, word.id).then((result) => {
+      const unit: WordGloss = {
+        word_ids: result.word_ids, original: result.original,
+        meaning: result.meaning, sentence_id: result.sentence_id,
+      }
+      setPaper((previous) => previous ? {
+        ...previous,
+        activity: result.activity || previous.activity,
+        word_glosses: {
+          ...previous.word_glosses,
+          ...Object.fromEntries(unit.word_ids.map((id) => [id, unit])),
+        },
+      } : previous)
+      revealGloss(unit, word, result.context_count, result.elapsed_ms)
+      return unit
+    }).catch((error: Error) => {
+      setNotice(error.message)
+      throw error
+    }).finally(() => {
+      wordRequests.current.delete(word.id)
+      setPendingWordIds((previous) => {
+        const next = new Set(previous)
+        next.delete(word.id)
+        return next
+      })
+    })
+    wordRequests.current.set(word.id, request)
+    void request.catch(() => undefined)
   }
 
   async function ask(event: FormEvent<HTMLFormElement>) {
@@ -284,23 +317,19 @@ export default function App() {
             <section className="reader-main" aria-label="논문 읽기">
               <div className="reader-controls">
                 <div className="reader-label"><span className="live-dot" /> ORIGINAL PAPER</div>
-                <div className="mode-switch" role="group" aria-label="읽기 모드">
-                  <button className={mode === 'word' ? 'active' : ''} onClick={() => setMode('word')}>단어 뜻</button>
-                  <button className={mode === 'sentence' ? 'active' : ''} onClick={() => setMode('sentence')}>문장 번역</button>
-                </div>
                 <div className="page-nav">
                   <button disabled={pageIndex === 0} onClick={() => setPageIndex(Math.max(0, pageIndex - 1))} aria-label="이전 페이지">‹</button>
                   <span>{pageIndex + 1}<i>/</i>{pdf.numPages}</span>
                   <button disabled={pageIndex + 1 >= pdf.numPages} onClick={() => setPageIndex(Math.min(pdf.numPages - 1, pageIndex + 1))} aria-label="다음 페이지">›</button>
                 </div>
               </div>
-              <p className="reader-hint">{mode === 'word' ? '모르는 단어를 누르면 원문 위에서 뜻을 확인할 수 있어요.' : '문장을 눌러 오른쪽에서 문맥에 맞는 번역을 확인하세요.'}{paper?.status !== 'ready' && <span> · 분석 중에도 원문을 먼저 읽을 수 있습니다.</span>}</p>
+              <p className="reader-hint">단어를 누르면 논문 전체에서 관련 문맥을 찾아 단어·복합 용어의 뜻만 보여줍니다.{paper?.status !== 'ready' && <span> · 문헌 검색 중에도 원문을 읽고 용어 뜻을 볼 수 있어요.</span>}</p>
               <div className="pdf-stage">
                 <PdfReader
                   document={pdf} pageIndex={pageIndex} page={currentPage}
-                  sentences={paper?.sentences || []} translations={paper?.translations || {}}
-                  translated={translated} selectedSentence={selectedSentence} mode={mode}
-                  onWord={toggleWord} onSentence={chooseSentence}
+                  wordGlosses={paper?.word_glosses || {}}
+                  translated={translated} pendingWordIds={pendingWordIds}
+                  onWord={toggleWord}
                 />
               </div>
               <div className="reader-foot"><span><Icon name="book" size={14} /> {paper?.pages?.length || pdf.numPages} PAGES</span><span>클릭한 단어는 내 단어장에 저장됩니다</span></div>
@@ -319,8 +348,7 @@ export default function App() {
 
               {panel === 'assistant' && <section className="dock-panel assistant-panel" role="tabpanel">
                 <div className="assistant-intro"><span className="assistant-avatar"><Icon name="spark" size={17} /></span><div><strong>논문 읽기 도우미</strong><p>논문의 내용과 수집한 자료를 바탕으로 답해요.</p></div></div>
-                {gloss && <div className="gloss-card"><div className="gloss-heading"><span>WORD IN CONTEXT</span><button onClick={() => setGloss(null)} aria-label="뜻 패널 닫기">×</button></div><div className="gloss-term">{gloss.original}<span>{gloss.meaning}</span></div>{gloss.sentence && <p>{gloss.sentence}</p>}</div>}
-                {currentSentence && currentTranslation && <div className="sentence-card"><div className="card-kicker">PAGE {currentSentence.page + 1} · SENTENCE</div><p className="sentence-original">{currentSentence.text}</p><p className="sentence-korean">{currentTranslation}</p></div>}
+                {gloss && <div className="gloss-card"><div className="gloss-heading"><span>WORD IN CONTEXT</span><button onClick={() => setGloss(null)} aria-label="뜻 패널 닫기">×</button></div><div className="gloss-term">{gloss.original}<span>{gloss.meaning}</span></div>{gloss.sentence && <p>{gloss.sentence}</p>}<small className="gloss-context-note">논문 문맥 {gloss.contextCount ? `${gloss.contextCount}곳` : '기반'}{gloss.elapsedMs ? ` · ${ (gloss.elapsedMs / 1000).toFixed(1)}초` : ' · 저장된 뜻'}</small></div>}
                 <div className="chat-scroll" ref={chatScroll}>
                   {turns.length === 0 ? <div className="chat-empty"><p className="chat-greeting">안녕하세요. 이 논문을 읽다가 막히는 부분이 있나요?</p><p>방법, 용어, 주장 사이의 관계를 물어보세요. 답변에는 근거 자료를 함께 표시합니다.</p><div className="prompt-list">{[
                     '이 논문이 해결하려는 문제는 무엇인가요?',
@@ -362,11 +390,11 @@ function AnalysisTimeline({ paper, paperId, uploading, onRetry }: { paper: Paper
   const activity = paper?.activity || []
   const sourcesReady = Boolean(paper?.sources_ready)
   const completedSteps = status === 'ready' ? 3 : sourcesReady ? 2 : paperId ? 1 : 0
-  const steps = ['논문 구조 읽기', '인용·관련 연구 찾기', '문장별 번역 준비']
+  const steps = ['논문 구조 읽기', '인용·관련 연구 찾기', '논문 문맥 검색 준비']
   const counts = countSources(paper?.sources || [])
   return <section className={`analysis-timeline ${status === 'failed' ? 'analysis-timeline--failed' : ''}`} aria-label="논문 분석 진행">
-    <div className="timeline-summary"><div className="timeline-title"><span className="timeline-symbol"><Icon name={status === 'ready' ? 'check' : 'network'} size={17} /></span><div><span className="timeline-kicker">PAPER PROCESS</span><strong>{status === 'ready' ? '분석이 끝났습니다' : status === 'failed' ? sourcesReady ? '문헌 수집 완료 · 후속 분석에 오류' : '분석을 마치지 못했습니다' : sourcesReady ? '문헌을 찾았습니다. 번역을 준비하고 있어요' : uploading && !paperId ? 'PDF를 읽을 준비 중입니다' : '인용·관련 연구를 찾고 있어요'}</strong></div></div>
-      <div className="timeline-detail">{sourcesReady ? <><b>{counts.references}</b>편 참고 <i>·</i> <b>{counts.citing}</b>편 피인용 <i>·</i> <b>{counts.related}</b>편 관련 자료{status === 'failed' && paper?.error ? <span> · {paper.error}</span> : null}</> : status === 'failed' ? paper?.error : '원문을 먼저 열었습니다. 분석이 진행되는 동안에도 읽을 수 있어요.'}</div>
+    <div className="timeline-summary"><div className="timeline-title"><span className="timeline-symbol"><Icon name={status === 'ready' ? 'check' : 'network'} size={17} /></span><div><span className="timeline-kicker">PAPER PROCESS</span><strong>{status === 'ready' ? '논문을 읽을 수 있습니다' : status === 'failed' ? sourcesReady ? '문헌 수집 완료 · 문맥 준비 오류' : '문헌 분석을 마치지 못했습니다' : sourcesReady ? '문헌을 찾았습니다. 검색 문맥을 준비하고 있어요' : uploading && !paperId ? 'PDF를 읽을 준비 중입니다' : '인용·관련 연구를 찾고 있어요'}</strong></div></div>
+      <div className="timeline-detail">{sourcesReady ? <><b>{counts.references}</b>편 참고 <i>·</i> <b>{counts.citing}</b>편 피인용 <i>·</i> <b>{counts.related}</b>편 관련 자료{status === 'failed' && paper?.error ? <span> · {paper.error}</span> : null}</> : status === 'failed' ? paper?.error : '원문은 먼저 열리고, 용어 뜻은 누를 때 생성됩니다.'}</div>
     </div>
     <div className="timeline-steps">{steps.map((label, index) => {
       const complete = index < completedSteps
@@ -403,7 +431,7 @@ function ResearchPanel({ title, sources, warnings, status, sourcesReady, error }
   return <div className="dock-panel research-panel" role="tabpanel">
     <div className="research-panel-heading"><p className="eyebrow">PAPER CONNECTIONS</p><h2>인용 지도</h2><p>논문 사이의 인용 관계를 한눈에 봅니다.</p></div>
     {!citationsReady ? <div className={`graph-wait ${status === 'failed' ? 'graph-wait--failed' : ''}`}><div className="graph-wait-mark"><Icon name="network" size={26} /></div><strong>{status === 'failed' ? '문헌 관계를 가져오지 못했습니다' : '관계를 찾고 있습니다'}</strong><p>{status === 'failed' ? error || '검색을 완료하지 못했습니다. 다시 시도해 주세요.' : '분석이 끝나면 참고문헌과 피인용 논문을 그래프로 보여드릴게요.'}</p></div> : <>
-      {status === 'processing' && <p className="collection-ready-note">문헌 검색은 끝났습니다. 번역은 별도로 계속 진행 중입니다.</p>}
+      {status === 'processing' && <p className="collection-ready-note">문헌 검색이 끝나면 논문 문맥 검색을 준비합니다. 용어 뜻은 클릭할 때 생성됩니다.</p>}
       {status === 'failed' && error && <p className="source-warning">문헌 정보는 보존했습니다. 이후 분석 단계에서 오류가 발생했습니다: {error}</p>}
       <div className="graph-counts"><div><strong>{counts.references}</strong><span>찾은 참고문헌</span></div><div><strong>{counts.citing}</strong><span>찾은 피인용</span></div><div><strong>{counts.related}</strong><span>관련 연구 후보</span></div></div>
       <div className="citation-graph-card"><div className="graph-card-heading"><div><strong>직접 인용 관계</strong><span>화살표는 인용 방향을 나타냅니다</span></div><div className="graph-legend"><i className="legend-reference" />인용<i className="legend-citing" />피인용</div></div><CitationGraph title={title} sources={sources} /></div>

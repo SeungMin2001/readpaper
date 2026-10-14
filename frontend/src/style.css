@@ -149,9 +149,6 @@ a { color: inherit; }
 .reader-controls { min-height: 53px; padding: 0 15px; display: flex; align-items: center; gap: 14px; border-bottom: 1px solid #e8e7e0; }
 .reader-label { display: flex; flex: 1; align-items: center; gap: 7px; color: #9aa198; font-size: 8px; font-weight: 700; letter-spacing: .13em; white-space: nowrap; }
 .live-dot { width: 6px; height: 6px; background: #99a38e; }
-.mode-switch { padding: 3px; display: flex; gap: 2px; border-radius: 4px; background: #f0f1eb; }
-.mode-switch button { padding: 6px 9px; border: 0; border-radius: 3px; background: transparent; color: #89938a; font-size: 9px; font-weight: 600; white-space: nowrap; }
-.mode-switch button.active { background: #fbfaf7; color: #34563d; box-shadow: 0 1px 3px rgba(43,58,43,.1); }
 .page-nav { display: flex; align-items: center; gap: 6px; color: #56645a; font-size: 10px; font-weight: 600; }
 .page-nav button { width: 25px; height: 25px; border: 1px solid #e0e2db; border-radius: 4px; background: #fbfaf7; color: #5d755f; font-size: 18px; line-height: 1; }
 .page-nav button:disabled { color: #c5cbc3; }
@@ -165,7 +162,8 @@ a { color: inherit; }
 .pdf-canvas { display: block; }
 .pdf-word { position: absolute; z-index: 2; display: flex; align-items: center; padding: 0; overflow: visible; border: 0; background: transparent; box-shadow: none; color: #214e31; font-size: 10px; font-weight: 700; letter-spacing: -.025em; line-height: 1; text-align: left; white-space: nowrap; }
 .pdf-word:hover { border-radius: 2px; outline: 1px solid rgba(99,150,91,.48); background: rgba(183,225,149,.34); }
-.pdf-word--selected { background: rgba(244,201,112,.32); }
+.pdf-word--pending { animation: gloss-pulse 1s ease-in-out infinite alternate; }
+@keyframes gloss-pulse { from { background: rgba(183,225,149,.16); } to { background: rgba(183,225,149,.65); } }
 .pdf-word--translated { z-index: 4; background: #fff; }
 .pdf-word--translated:hover { background: #eff8e9; }
 .pdf-word--first { z-index: 5; max-width: 360px; padding: 0 2px; border-radius: 2px; background: #e0edd7; box-shadow: 0 0 0 1px #b8cdb0; }
@@ -191,16 +189,13 @@ a { color: inherit; }
 .assistant-avatar { width: 29px; height: 29px; flex: none; display: grid; place-items: center; border-radius: 50%; background: #e9efe4; color: #567456; }
 .assistant-intro strong { color: #485d4b; font-size: 10px; font-weight: 600; }
 .assistant-intro p { margin: 3px 0 0; color: #9aa29a; font-size: 9px; }
-.gloss-card, .sentence-card { flex: none; margin: 10px 12px 0; padding: 11px 12px; border: 1px solid #e2e7dd; border-radius: 5px; background: #f2f5ee; }
+.gloss-card { flex: none; margin: 10px 12px 0; padding: 11px 12px; border: 1px solid #e2e7dd; border-radius: 5px; background: #f2f5ee; }
 .gloss-heading { display: flex; align-items: center; justify-content: space-between; color: #899588; font-size: 7px; font-weight: 700; letter-spacing: .15em; }
 .gloss-heading button { padding: 0 2px; border: 0; background: transparent; color: #899588; font-size: 15px; line-height: 1; }
 .gloss-term { margin-top: 6px; display: flex; align-items: baseline; flex-wrap: wrap; gap: 9px; color: #294536; font-family: 'DM Serif Display', serif; font-size: 18px; }
 .gloss-term span { color: #526d53; font-family: 'Noto Sans KR', sans-serif; font-size: 12px; font-weight: 600; }
 .gloss-card > p { margin: 7px 0 0; color: #768179; font-family: Georgia, serif; font-size: 10px; line-height: 1.55; }
-.sentence-card { border-color: #e9e5d8; background: #f7f5ed; }
-.card-kicker { color: #9b9885; font-size: 7px; font-weight: 700; letter-spacing: .13em; }
-.sentence-card .sentence-original { margin: 8px 0 0; color: #49544a; font-family: Georgia, serif; font-size: 11px; line-height: 1.55; }
-.sentence-card .sentence-korean { margin: 7px 0 0; padding-top: 7px; border-top: 1px solid #e9e5d8; color: #435b45; font-size: 11px; line-height: 1.65; }
+.gloss-context-note { margin-top: 7px; display: block; color: #8a9489; font-size: 8px; }
 .chat-scroll { min-height: 0; flex: 1; padding: 17px 14px 14px; overflow-y: auto; scroll-behavior: smooth; }
 .chat-empty { max-width: 330px; padding: 8px 3px; }
 .chat-greeting { margin: 0 0 7px; color: #425747; font-family: 'DM Serif Display', 'Noto Sans KR', serif; font-size: 17px; line-height: 1.45; letter-spacing: -.025em; }
@@ -391,8 +386,6 @@ a { color: inherit; }
   .timeline-step-copy span { font-size: 6px; }
   .reader-controls { min-height: 47px; padding: 0 7px; gap: 6px; }
   .reader-label { display: none; }
-  .mode-switch { margin-right: auto; }
-  .mode-switch button { padding: 6px; font-size: 8px; }
   .page-nav { gap: 4px; font-size: 9px; }
   .page-nav button { width: 23px; height: 23px; }
   .reader-hint { padding: 8px; font-size: 8px; }

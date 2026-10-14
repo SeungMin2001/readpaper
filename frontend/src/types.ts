@@ -23,15 +23,11 @@ export type Sentence = {
   word_ids: string[]
 }
 
-export type TranslationUnit = {
+export type WordGloss = {
   word_ids: string[]
   original: string
   meaning: string
-}
-
-export type SentenceTranslation = {
-  translation: string
-  units: TranslationUnit[]
+  sentence_id: string
 }
 
 export type Source = {
@@ -79,8 +75,7 @@ export type Paper = {
   error: string | null
   pages?: PaperPage[]
   sentences?: Sentence[]
-  translations?: Record<string, SentenceTranslation>
-  profile?: { summary: string; keywords: string[] }
+  word_glosses?: Record<string, WordGloss>
   sources_ready?: boolean
   sources?: Source[]
   source_warnings?: string[]

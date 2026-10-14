@@ -1,25 +1,21 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { PDFDocumentProxy } from 'pdfjs-dist'
-import type { PaperPage, Sentence, SentenceTranslation, TranslationUnit, Word } from './types'
+import type { PaperPage, Word, WordGloss } from './types'
 
-type UnitReference = { key: string; unit: TranslationUnit; first: boolean }
+type GlossReference = { key: string; gloss: WordGloss; first: boolean }
 
 type Props = {
   document: PDFDocumentProxy
   pageIndex: number
   page?: PaperPage
-  sentences: Sentence[]
-  translations: Record<string, SentenceTranslation>
+  wordGlosses: Record<string, WordGloss>
   translated: Set<string>
-  selectedSentence: string | null
-  mode: 'word' | 'sentence'
-  onWord: (key: string, unit: TranslationUnit, word: Word) => void
-  onSentence: (id: string) => void
+  pendingWordIds: Set<string>
+  onWord: (word: Word, gloss?: WordGloss) => void
 }
 
 export default function PdfReader({
-  document, pageIndex, page, sentences, translations, translated,
-  selectedSentence, mode, onWord, onSentence,
+  document, pageIndex, page, wordGlosses, translated, pendingWordIds, onWord,
 }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const frameRef = useRef<HTMLDivElement>(null)
@@ -90,19 +86,14 @@ export default function PdfReader({
   }, [document, pageIndex, page?.index, page?.width])
 
   const byWord = useMemo(() => {
-    const map = new Map<string, UnitReference>()
-    for (const sentence of sentences) {
-      const translation = translations[sentence.id]
-      if (!translation) continue
-      translation.units.forEach((unit, index) => {
-        const key = `${sentence.id}:${index}`
-        unit.word_ids.forEach((id, wordIndex) => {
-          map.set(id, { key, unit, first: wordIndex === 0 })
-        })
-      })
+    const map = new Map<string, GlossReference>()
+    for (const [wordId, gloss] of Object.entries(wordGlosses)) {
+      const key = gloss.word_ids.join(':')
+      gloss.word_ids.forEach((id, wordIndex) => map.set(id, { key, gloss, first: wordIndex === 0 }))
+      if (!gloss.word_ids.includes(wordId)) map.set(wordId, { key, gloss, first: false })
     }
     return map
-  }, [sentences, translations])
+  }, [wordGlosses])
 
   return (
     <div ref={frameRef} className="pdf-frame">
@@ -111,7 +102,7 @@ export default function PdfReader({
         {(page?.words || []).map((word) => {
           const ref = byWord.get(word.id)
           const active = Boolean(ref && translated.has(ref.key))
-          const isSelected = selectedSentence === word.sentence_id
+          const pending = pendingWordIds.has(word.id)
           const width = Math.max((word.x1 - word.x0) * scale, 8)
           const height = Math.max((word.y1 - word.y0) * scale, 8)
           return (
@@ -119,9 +110,8 @@ export default function PdfReader({
               key={word.id}
               type="button"
               className={[
-                'pdf-word', active ? 'pdf-word--translated' : '',
+                'pdf-word', active ? 'pdf-word--translated' : '', pending ? 'pdf-word--pending' : '',
                 active && ref?.first ? 'pdf-word--first' : '',
-                isSelected ? 'pdf-word--selected' : '',
               ].join(' ')}
               style={{
                 left: word.x0 * scale,
@@ -131,14 +121,12 @@ export default function PdfReader({
                 height,
                 fontSize: Math.max(8, Math.min(height * 0.86, 15)),
               }}
-              title={mode === 'sentence' ? '이 문장 번역 보기' : ref ? `${ref.unit.original} 뜻 보기` : word.text}
-              aria-label={mode === 'sentence' ? `${word.text}가 포함된 문장 선택` : `${word.text} 뜻 보기`}
-              onClick={() => {
-                if (mode === 'sentence') onSentence(word.sentence_id)
-                else if (ref) onWord(ref.key, ref.unit, word)
-              }}
+              title={pending ? '문맥에서 용어를 찾고 있어요' : ref ? `${ref.gloss.original} 뜻 보기` : `${word.text} 문맥 뜻 보기`}
+              aria-label={`${word.text}의 문맥 뜻 보기`}
+              disabled={pending}
+              onClick={() => onWord(word, ref?.gloss)}
             >
-              {active && ref?.first ? ref.unit.meaning : ''}
+              {active && ref?.first ? ref.gloss.meaning : ''}
             </button>
           )
         })}

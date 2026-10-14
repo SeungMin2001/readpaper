@@ -9,7 +9,7 @@ class Settings:
         "READPAPER_DATA_DIR", str(Path(__file__).resolve().parents[2] / "data" / "runtime")
     ))
     ollama_url: str = os.getenv("READPAPER_OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
-    ollama_model: str = os.getenv("READPAPER_OLLAMA_MODEL", "qwen3:8b")
+    ollama_model: str = os.getenv("READPAPER_OLLAMA_MODEL", "gemma4:12b")
     openalex_url: str = os.getenv("READPAPER_OPENALEX_URL", "https://api.openalex.org").rstrip("/")
     openalex_api_key: str = os.getenv("READPAPER_OPENALEX_API_KEY", "")
     unpaywall_email: str = os.getenv("READPAPER_UNPAYWALL_EMAIL", "")

@@ -105,6 +105,38 @@ def set_paper(paper_id: str, *, status: str | None = None, progress: int | None 
         db.execute(f"UPDATE papers SET {', '.join(fields)} WHERE id = ?", values)
 
 
+def merge_paper_data(paper_id: str, updates: dict[str, Any]) -> bool:
+    with connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        row = db.execute("SELECT data_json FROM papers WHERE id = ?", (paper_id,)).fetchone()
+        if row is None:
+            return False
+        data = json.loads(row["data_json"])
+        data.update(updates)
+        db.execute(
+            "UPDATE papers SET data_json = ? WHERE id = ?",
+            (json.dumps(data, ensure_ascii=False), paper_id),
+        )
+    return True
+
+
+def save_word_gloss(paper_id: str, word_ids: list[str], gloss: dict[str, Any]) -> bool:
+    with connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        row = db.execute("SELECT data_json FROM papers WHERE id = ?", (paper_id,)).fetchone()
+        if row is None:
+            return False
+        data = json.loads(row["data_json"])
+        word_glosses = data.setdefault("word_glosses", {})
+        for word_id in word_ids:
+            word_glosses[word_id] = gloss
+        db.execute(
+            "UPDATE papers SET data_json = ? WHERE id = ?",
+            (json.dumps(data, ensure_ascii=False), paper_id),
+        )
+    return True
+
+
 def clear_paper_activity(paper_id: str) -> None:
     with connect() as db:
         db.execute("DELETE FROM paper_activity WHERE paper_id = ?", (paper_id,))

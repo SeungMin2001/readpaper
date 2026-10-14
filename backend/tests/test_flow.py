@@ -16,8 +16,8 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from readpaper import db  # noqa: E402
 from readpaper.config import Settings  # noqa: E402
-from readpaper.llm import InvalidModelOutput, ModelUnavailable, validate_translation  # noqa: E402
-from readpaper.main import app  # noqa: E402
+from readpaper.llm import InvalidModelOutput, ModelUnavailable, validate_keyword_gloss  # noqa: E402
+from readpaper.main import _word_context, app  # noqa: E402
 from readpaper.pdf import extract_pdf  # noqa: E402
 from readpaper.rag import build_chunks, retrieve  # noqa: E402
 from readpaper.sources import collect_external_sources, reconstruct_abstract  # noqa: E402
@@ -46,33 +46,18 @@ def example_pdf() -> bytes:
 
 class FakeOllama:
     def __init__(self):
-        self.translation_batch_calls = 0
-
-    async def profile(self, title, full_text):
-        return {"summary": "로봇 제어와 언어 분석 연구", "keywords": ["reinforcement learning"]}
+        self.keyword_calls = 0
+        self.last_passages = []
 
     async def select_related_papers(self, profile, candidates, limit=8):
         return candidates[:limit]
 
-    async def translate_sentence(self, sentence, tokens, profile, previous, following):
-        units = []
-        index = 0
-        while index < len(tokens):
-            end = 2 if index == 0 and tokens[:2] == ["Reinforcement", "learning"] else index + 1
-            units.append({"start": index, "end": end, "meaning": "강화학습" if end == 2 and index == 0 else "뜻"})
-            index = end
-        return validate_translation({"translation": "문맥에 맞는 문장 번역", "units": units}, len(tokens))
-
-    async def translate_sentences(self, requests, profile):
-        self.translation_batch_calls += 1
-        results = {}
-        for request in requests:
-            sentence = {"id": request["id"], "text": request["sentence"]}
-            results[request["id"]] = await self.translate_sentence(
-                sentence, request["tokens"], profile,
-                request["previous_sentence"], request["following_sentence"],
-            )
-        return results
+    async def translate_keyword(self, title, sentence, tokens, focus_index, paper_passages):
+        self.keyword_calls += 1
+        self.last_passages = paper_passages
+        if tokens[:2] == ["Reinforcement", "learning"] and focus_index < 2:
+            return {"start": 0, "end": 2, "meaning": "강화학습"}
+        return {"start": focus_index, "end": focus_index + 1, "meaning": "문맥상 뜻"}
 
     async def search_query(self, question):
         return "robotic control"
@@ -120,7 +105,23 @@ class ReadpaperFlowTests(unittest.TestCase):
         self.assertEqual(texts[3], "Transformers encode contextual language features.")
         self.assertTrue(all(word["sentence_id"] for word in parsed["pages"][0]["words"]))
 
-    def test_upload_translation_rag_and_vocabulary(self):
+    def test_original_pages_are_available_while_source_collection_runs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Settings(data_dir=Path(directory), dev_mode=True)
+            with patch("readpaper.db.settings", config), patch("readpaper.main.settings", config):
+                with TestClient(app) as client:
+                    parsed = extract_pdf(example_pdf())
+                    db.create_paper("paper-processing", parsed["title"], parsed)
+                    response = client.get("/api/papers/paper-processing")
+
+                    self.assertEqual(response.status_code, 200)
+                    paper = response.json()
+                    self.assertEqual(paper["status"], "processing")
+                    self.assertEqual(len(paper["pages"]), 1)
+                    self.assertEqual(len(paper["sentences"]), 6)
+                    self.assertEqual(paper["word_glosses"], {})
+
+    def test_upload_keyword_gloss_rag_and_vocabulary(self):
         with tempfile.TemporaryDirectory() as directory:
             config = Settings(data_dir=Path(directory), dev_mode=True)
             fake_model = FakeOllama()
@@ -137,12 +138,25 @@ class ReadpaperFlowTests(unittest.TestCase):
                     paper_id = upload.json()["paper_id"]
                     paper = client.get(f"/api/papers/{paper_id}").json()
                     self.assertEqual(paper["status"], "ready")
-                    self.assertEqual(len(paper["translations"]), 6)
-                    self.assertEqual(fake_model.translation_batch_calls, 2)
-                    first_unit = paper["translations"]["s0"]["units"][0]
+                    self.assertEqual(len(paper["sentences"]), 6)
+                    self.assertEqual(paper["word_glosses"], {})
+                    self.assertEqual(fake_model.keyword_calls, 0)
+
+                    gloss_response = client.post(
+                        f"/api/papers/{paper_id}/translate-word", json={"word_id": "w0"},
+                    )
+                    self.assertEqual(gloss_response.status_code, 200, gloss_response.text)
+                    first_unit = gloss_response.json()
                     self.assertEqual(first_unit["original"], "Reinforcement learning")
                     self.assertEqual(first_unit["meaning"], "강화학습")
                     self.assertEqual(len(first_unit["word_ids"]), 2)
+                    self.assertGreaterEqual(len(fake_model.last_passages), 1)
+                    cached_gloss = client.post(
+                        f"/api/papers/{paper_id}/translate-word", json={"word_id": "w1"},
+                    ).json()
+                    self.assertTrue(cached_gloss["cached"])
+                    self.assertEqual(fake_model.keyword_calls, 1)
+                    self.assertEqual(len(client.get(f"/api/papers/{paper_id}").json()["word_glosses"]), 2)
 
                     answer = client.post(
                         f"/api/papers/{paper_id}/ask", json={"question": "로봇 제어는 어떻게 개선되나요?"}
@@ -173,7 +187,7 @@ class ReadpaperFlowTests(unittest.TestCase):
 
     def test_discovered_sources_are_visible_if_local_model_is_unavailable(self):
         class OfflineOllama:
-            async def profile(self, title, full_text):
+            async def translate_keyword(self, *args, **kwargs):
                 raise ModelUnavailable("Mac mini Ollama is offline")
 
         with tempfile.TemporaryDirectory() as directory:
@@ -188,24 +202,38 @@ class ReadpaperFlowTests(unittest.TestCase):
                     )
                     self.assertEqual(upload.status_code, 200, upload.text)
 
-                    paper = client.get(f"/api/papers/{upload.json()['paper_id']}").json()
-                    self.assertEqual(paper["status"], "failed")
+                    paper_id = upload.json()["paper_id"]
+                    paper = client.get(f"/api/papers/{paper_id}").json()
+                    self.assertEqual(paper["status"], "ready")
                     self.assertTrue(paper["sources_ready"])
                     self.assertEqual([source["title"] for source in paper["sources"]], ["A related study"])
                     self.assertIn(
                         "OpenAlex에서 관련 연구 후보를 확인했습니다",
                         [event["message"] for event in paper["activity"]],
                     )
-                    self.assertEqual(paper["activity"][-1]["state"], "error")
+                    self.assertEqual(
+                        client.post(f"/api/papers/{paper_id}/translate-word", json={"word_id": "w0"}).status_code,
+                        503,
+                    )
+                    self.assertEqual(client.get(f"/api/papers/{paper_id}").json()["status"], "ready")
 
-    def test_invalid_gloss_alignment_rejected(self):
+    def test_model_gloss_span_must_include_clicked_token(self):
         with self.assertRaises(InvalidModelOutput):
-            validate_translation({
-                "translation": "번역", "units": [
-                    {"start": 0, "end": 1, "meaning": "가"},
-                    {"start": 2, "end": 3, "meaning": "다"},
-                ],
-            }, 3)
+            validate_keyword_gloss({"start": 0, "end": 1, "meaning": "뜻"}, 3, 2)
+
+    def test_word_context_uses_other_passages_from_uploaded_paper_only(self):
+        sentences = [
+            {"id": "s0", "text": "Attention selects useful features."},
+            {"id": "s1", "text": "We apply attention to token representations."},
+        ]
+        passages = _word_context(sentences, "Attention", "s0", [
+            {"kind": "paper", "text": "The model uses attention weights to focus on tokens."},
+            {"kind": "related", "text": "External attention paper unrelated to this document."},
+        ])
+
+        self.assertIn(sentences[1]["text"], passages)
+        self.assertTrue(any("attention weights" in passage for passage in passages))
+        self.assertFalse(any("External attention" in passage for passage in passages))
 
     def test_retrieval_and_abstract_reconstruction(self):
         self.assertEqual(
