@@ -193,8 +193,20 @@ def validate_keyword_gloss(
     result: dict[str, Any], token_count: int, focus_index: int,
 ) -> dict[str, Any]:
     start, end, meaning = result.get("start"), result.get("end"), result.get("meaning")
-    if (type(start) is not int or type(end) is not int or start < 0 or end <= start
-            or end > token_count or not start <= focus_index < end):
+    valid_span = (
+        type(start) is int and type(end) is int and start >= 0 and end > start
+        and end <= token_count and start <= focus_index < end
+    )
+    if not valid_span and type(start) is int and type(end) is int:
+        # Some model responses use one-based token positions despite the prompt.
+        # Convert only when the adjusted range is valid and includes the clicked token.
+        adjusted_start, adjusted_end = start - 1, end - 1
+        if (adjusted_start >= 0 and adjusted_end > adjusted_start
+                and adjusted_end <= token_count
+                and adjusted_start <= focus_index < adjusted_end):
+            start, end = adjusted_start, adjusted_end
+            valid_span = True
+    if not valid_span:
         raise InvalidModelOutput("용어 범위가 선택한 단어를 포함하지 않거나 문장 범위를 벗어났습니다.")
     if not isinstance(meaning, str) or not meaning.strip() or len(meaning) > 100:
         raise InvalidModelOutput("용어 뜻이 없거나 너무 깁니다.")

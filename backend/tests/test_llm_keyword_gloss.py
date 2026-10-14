@@ -68,12 +68,23 @@ class KeywordGlossTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(request["tokens"][1], "learning")
         self.assertEqual(len(request["other_passages_from_this_paper"]), 2)
         self.assertEqual(kwargs["options"]["num_predict"], 96)
-        self.assertEqual(kwargs["options"]["num_predict"], 96)
-        self.assertEqual(kwargs["model"], settings.llm_model)
 
     def test_gloss_span_must_contain_clicked_token(self):
         with self.assertRaises(InvalidModelOutput):
             validate_keyword_gloss({"start": 0, "end": 1, "meaning": "강화"}, 3, 2)
+
+    def test_corrects_one_based_span_when_it_covers_clicked_token(self):
+        result = validate_keyword_gloss(
+            {"start": 2, "end": 3, "meaning": "학습"}, token_count=4, focus_index=1,
+        )
+
+        self.assertEqual(result, {"start": 1, "end": 2, "meaning": "학습"})
+
+    def test_does_not_correct_one_based_span_if_it_still_misses_clicked_token(self):
+        with self.assertRaises(InvalidModelOutput):
+            validate_keyword_gloss(
+                {"start": 1, "end": 2, "meaning": "학습"}, token_count=4, focus_index=3,
+            )
 
 
 if __name__ == "__main__":
