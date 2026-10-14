@@ -119,6 +119,35 @@ class OllamaClient:
         query = result.get("query")
         return query[:300] if isinstance(query, str) and query.strip() else korean_question
 
+    async def select_related_papers(
+        self, profile: dict[str, Any], candidates: list[dict[str, Any]], limit: int = 8,
+    ) -> list[dict[str, Any]]:
+        if not candidates or limit < 1:
+            return []
+        candidates = candidates[:25]
+        candidate_payload = [{
+            "id": item["id"],
+            "title": item["title"],
+            "year": item.get("year"),
+            "abstract": item.get("text", "")[:500],
+            "candidate_type": item.get("kind"),
+        } for item in candidates]
+        expected_count = min(limit, len(candidate_payload))
+        system = (
+            "You rank scientific papers for relevance to an uploaded research paper. "
+            f"Select exactly the {expected_count} most relevant items from the supplied candidates. "
+            "Use the paper's research question, methods, and findings, not keyword overlap alone. "
+            "Never invent or alter candidate IDs. Return only JSON with key selections, an array "
+            'of objects shaped as {"id":"candidate-id","reason":"short reason"}, ordered most relevant first.'
+        )
+        request = {
+            "uploaded_paper": profile.get("summary", ""),
+            "keywords": profile.get("keywords", []),
+            "candidates": candidate_payload,
+        }
+        result = await self.chat_json(system, json.dumps(request, ensure_ascii=False))
+        return validate_related_selection(result, candidates, limit)
+
     async def answer(self, question: str, contexts: list[dict[str, Any]]) -> dict[str, Any]:
         evidence = [
             {"id": item["id"], "title": item["title"], "text": item["text"][:1600]}
@@ -162,3 +191,32 @@ def validate_translation(result: dict[str, Any], token_count: int) -> dict[str, 
     if cursor != token_count:
         raise InvalidModelOutput("마지막 단어까지 번역되지 않았습니다.")
     return {"translation": translation.strip(), "units": clean_units}
+
+
+def validate_related_selection(
+    result: dict[str, Any], candidates: list[dict[str, Any]], limit: int = 8,
+) -> list[dict[str, Any]]:
+    selections = result.get("selections")
+    if not isinstance(selections, list):
+        raise InvalidModelOutput("관련 논문 선택 결과에 selections 배열이 없습니다.")
+    by_id = {item.get("id"): item for item in candidates if isinstance(item.get("id"), str)}
+    expected_count = min(limit, len(by_id))
+    if len(selections) != expected_count:
+        raise InvalidModelOutput("관련 논문 선택 개수가 후보 수 또는 요청한 개수와 다릅니다.")
+    selected: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for rank, selection in enumerate(selections, start=1):
+        if not isinstance(selection, dict):
+            raise InvalidModelOutput("관련 논문 선택 항목이 객체가 아닙니다.")
+        paper_id = selection.get("id")
+        reason = selection.get("reason")
+        if not isinstance(paper_id, str) or paper_id not in by_id or paper_id in seen:
+            raise InvalidModelOutput("관련 논문 선택에 알 수 없거나 중복된 후보 ID가 있습니다.")
+        if not isinstance(reason, str) or not reason.strip() or len(reason) > 500:
+            raise InvalidModelOutput("관련 논문 선택 사유가 없거나 너무 깁니다.")
+        seen.add(paper_id)
+        selected.append(by_id[paper_id] | {
+            "llm_relevance_rank": rank,
+            "llm_relevance_reason": reason.strip(),
+        })
+    return selected

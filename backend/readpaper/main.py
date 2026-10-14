@@ -152,6 +152,13 @@ async def process_paper(paper_id: str) -> None:
         external, warnings = await collect_external_sources(
             payload["title"], payload.get("doi"), profile["keywords"]
         )
+        related_candidates = [
+            source for source in external if source.get("kind") in {"related", "recent"}
+        ]
+        selected_related = await model.select_related_papers(profile, related_candidates, limit=8)
+        external = [
+            source for source in external if source.get("kind") not in {"related", "recent"}
+        ] + selected_related
         payload["external_sources"] = external
         payload["source_warnings"] = warnings
         db.set_paper(paper_id, progress=12)

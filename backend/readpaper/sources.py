@@ -27,6 +27,12 @@ def _similar_title(left: str, right: str) -> bool:
     return bool(first and second) and SequenceMatcher(None, first, second).ratio() >= 0.8
 
 
+def _openalex_params(params: dict[str, Any]) -> dict[str, Any]:
+    if settings.openalex_api_key:
+        return params | {"api_key": settings.openalex_api_key}
+    return params
+
+
 def _paper_source(work: dict[str, Any], kind: str, index: int) -> dict[str, Any] | None:
     abstract = reconstruct_abstract(work.get("abstract_inverted_index"))
     if not work.get("display_name"):
@@ -114,18 +120,28 @@ async def collect_external_sources(title: str, doi: str | None, keywords: list[s
     headers = {"User-Agent": "Readpaper/0.1 (research paper reading assistant)"}
     async with httpx.AsyncClient(timeout=timeout, headers=headers, follow_redirects=True) as client:
         work: dict[str, Any] | None = None
-        try:
-            params = {"per-page": 1}
-            if doi:
-                params["filter"] = f"doi:https://doi.org/{doi}"
-            else:
-                params["search"] = title[:200]
-            response = await client.get(f"{settings.openalex_url}/works", params=params)
-            response.raise_for_status()
-            results = response.json().get("results", [])
-            if results and (doi or _similar_title(title, results[0].get("display_name", ""))):
-                work = results[0]
-        except (httpx.HTTPError, ValueError, KeyError, TypeError):
+        lookup_requests = []
+        if doi:
+            lookup_requests.append({"filter": f"doi:https://doi.org/{doi}", "per-page": 5})
+        lookup_requests.append({"search": title[:200], "per-page": 5})
+        lookup_errors = []
+        for params in lookup_requests:
+            try:
+                response = await client.get(
+                    f"{settings.openalex_url}/works", params=_openalex_params(params)
+                )
+                response.raise_for_status()
+                results = response.json().get("results", [])
+            except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
+                lookup_errors.append(type(exc).__name__)
+                continue
+            work = next((
+                item for item in results
+                if _similar_title(title, item.get("display_name", ""))
+            ), None)
+            if work:
+                break
+        if not work and lookup_errors:
             warnings.append("OpenAlex에 연결할 수 없어 관련·인용 논문을 수집하지 못했습니다.")
 
         if work:
@@ -148,9 +164,9 @@ async def collect_external_sources(title: str, doi: str | None, keywords: list[s
             for offset in range(0, len(relation_ids), 50):
                 batch = relation_ids[offset:offset + 50]
                 try:
-                    response = await client.get(f"{settings.openalex_url}/works", params={
+                    response = await client.get(f"{settings.openalex_url}/works", params=_openalex_params({
                         "filter": f"openalex_id:{'|'.join(batch)}", "per-page": len(batch),
-                    })
+                    }))
                     response.raise_for_status()
                     batch_results = response.json().get("results", [])
                     by_id = {
@@ -168,7 +184,9 @@ async def collect_external_sources(title: str, doi: str | None, keywords: list[s
             try:
                 response = await client.get(
                     f"{settings.openalex_url}/works",
-                    params={"filter": f"cites:{work['id'].rsplit('/', 1)[-1]}", "per-page": 5},
+                    params=_openalex_params({
+                        "filter": f"cites:{work['id'].rsplit('/', 1)[-1]}", "per-page": 5,
+                    }),
                 )
                 response.raise_for_status()
                 for item in response.json().get("results", []):
@@ -184,11 +202,13 @@ async def collect_external_sources(title: str, doi: str | None, keywords: list[s
             query = " ".join(keywords[:2])[:160]
             query_terms = set(re.findall(r"[a-z0-9]+", query.lower())) - {"and", "of", "the", "for", "in"}
             try:
-                response = await client.get(f"{settings.openalex_url}/works", params={
+                response = await client.get(
+                    f"{settings.openalex_url}/works", params=_openalex_params({
                     "search": query,
                     "filter": f"from_publication_date:{cutoff},to_publication_date:{today}",
                     "sort": "publication_date:desc", "per-page": 20,
-                })
+                    }),
+                )
                 response.raise_for_status()
                 for item in response.json().get("results", []):
                     if sum(source["kind"] == "recent" for source in sources) >= 5:

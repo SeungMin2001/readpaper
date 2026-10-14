@@ -1,0 +1,87 @@
+{
+  "11": {
+    "pdf_url": "https://openaccess.thecvf.com/content_cvpr_2016/papers/He_Deep_Residual_Learning_CVPR_2016_paper.pdf",
+    "source": "CVF Open Access",
+    "version": "publishedVersion"
+  },
+  "13": {
+    "pdf_url": "https://www.bioinf.jku.at/publications/older/2604.pdf",
+    "source": "JKU author-hosted copy",
+    "version": "author-hosted copy"
+  },
+  "14": {
+    "pdf_url": "https://aclanthology.org/D09-1087.pdf",
+    "source": "ACL Anthology",
+    "version": "publishedVersion"
+  },
+  "25": {
+    "pdf_url": "https://aclanthology.org/J93-2004.pdf",
+    "source": "ACL Anthology",
+    "version": "publishedVersion"
+  },
+  "26": {
+    "pdf_url": "https://aclanthology.org/N06-1020.pdf",
+    "source": "ACL Anthology",
+    "version": "publishedVersion"
+  },
+  "29": {
+    "pdf_url": "https://aclanthology.org/P06-1055.pdf",
+    "source": "ACL Anthology",
+    "version": "publishedVersion"
+  },
+  "33": {
+    "pdf_url": "https://jmlr.org/papers/volume15/srivastava14a/srivastava14a.pdf",
+    "source": "Journal of Machine Learning Research",
+    "version": "publishedVersion"
+  },
+  "40": {
+    "pdf_url": "https://aclanthology.org/P13-1043.pdf",
+    "source": "ACL Anthology",
+    "version": "publishedVersion"
+  },
+  "8": {
+    "pdf_url": "https://www.aclweb.org/anthology/N16-1024.pdf",
+    "source": "ACL Anthology",
+    "version": "publishedVersion"
+  },
+  "16": {
+    "pdf_url": "https://arxiv.org/pdf/1610.08613",
+    "source": "arXiv",
+    "version": "preprint"
+  },
+  "17": {
+    "pdf_url": "https://arxiv.org/pdf/1511.08228",
+    "source": "arXiv",
+    "version": "preprint"
+  },
+  "19": {
+    "pdf_url": "https://arxiv.org/pdf/1702.00887",
+    "source": "arXiv",
+    "version": "preprint"
+  },
+  "20": {
+    "pdf_url": "https://arxiv.org/pdf/1412.6980",
+    "source": "arXiv",
+    "version": "submittedVersion"
+  },
+  "27": {
+    "pdf_url": "https://aclanthology.org/D16-1244.pdf",
+    "source": "ACL Anthology",
+    "version": "publishedVersion"
+  },
+  "34": {
+    "pdf_url": "https://arxiv.org/pdf/1503.08895",
+    "source": "arXiv",
+    "version": "preprint"
+  },
+  "35": {
+    "pdf_url": "https://arxiv.org/pdf/1409.3215",
+    "source": "arXiv",
+    "version": "preprint"
+  },
+  "37": {
+    "pdf_url": "https://arxiv.org/pdf/1412.7449",
+    "source": "arXiv",
+    "version": "preprint"
+  }
+}

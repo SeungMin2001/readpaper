@@ -48,6 +48,9 @@ class FakeOllama:
     async def profile(self, title, full_text):
         return {"summary": "로봇 제어와 언어 분석 연구", "keywords": ["reinforcement learning"]}
 
+    async def select_related_papers(self, profile, candidates, limit=8):
+        return candidates[:limit]
+
     async def translate_sentence(self, sentence, tokens, profile, previous, following):
         units = []
         index = 0
@@ -282,6 +285,45 @@ class ReadpaperFlowTests(unittest.TestCase):
         self.assertFalse(warnings)
         self.assertFalse(any(item["kind"] != "background" for item in unrelated))
         self.assertTrue(unrelated_warnings)
+
+    def test_mismatched_doi_metadata_falls_back_to_a_title_match(self):
+        def work(work_id, title):
+            return {
+                "id": f"https://openalex.org/{work_id}", "display_name": title,
+                "abstract_inverted_index": {}, "authorships": [], "doi": None,
+            }
+
+        def respond(request):
+            params = request.url.params
+            relation_filter = params.get("filter", "")
+            if relation_filter.startswith("doi:"):
+                return httpx.Response(200, json={"results": [{
+                    **work("W1", "A Completely Different Paper"),
+                    "referenced_works": [], "related_works": [],
+                }]})
+            if "search" in params:
+                return httpx.Response(200, json={"results": [{
+                    **work("W100", "Correct Root Paper"),
+                    "referenced_works": ["https://openalex.org/W2"],
+                    "related_works": [],
+                }]})
+            if relation_filter.startswith("openalex_id:"):
+                return httpx.Response(200, json={"results": [work("W2", "A Cited Paper")]})
+            return httpx.Response(200, json={"results": []})
+
+        client_class = httpx.AsyncClient
+        transport = httpx.MockTransport(respond)
+        with patch("readpaper.sources.httpx.AsyncClient", side_effect=lambda **kwargs: client_class(
+            transport=transport, **kwargs,
+        )):
+            sources, warnings = asyncio.run(collect_external_sources(
+                "Correct Root Paper", "10.1234/wrong", [],
+            ))
+
+        self.assertEqual([(item["kind"], item["title"]) for item in sources], [
+            ("referenced", "A Cited Paper"),
+        ])
+        self.assertFalse(warnings)
 
 
 if __name__ == "__main__":

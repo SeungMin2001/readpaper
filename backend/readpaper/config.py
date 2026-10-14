@@ -11,6 +11,9 @@ class Settings:
     ollama_url: str = os.getenv("READPAPER_OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
     ollama_model: str = os.getenv("READPAPER_OLLAMA_MODEL", "qwen3:8b")
     openalex_url: str = os.getenv("READPAPER_OPENALEX_URL", "https://api.openalex.org").rstrip("/")
+    openalex_api_key: str = os.getenv("READPAPER_OPENALEX_API_KEY", "")
+    unpaywall_email: str = os.getenv("READPAPER_UNPAYWALL_EMAIL", "")
+    crossref_email: str = os.getenv("READPAPER_CROSSREF_EMAIL", "")
     wikipedia_url: str = os.getenv("READPAPER_WIKIPEDIA_URL", "https://en.wikipedia.org/w/api.php")
     max_upload_bytes: int = 25 * 1024 * 1024
     paper_ttl_seconds: int = 24 * 60 * 60
