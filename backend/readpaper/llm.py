@@ -2,6 +2,7 @@ import json
 import re
 import time
 import unicodedata
+from contextlib import asynccontextmanager
 from typing import Any
 
 import httpx
@@ -15,6 +16,32 @@ class ModelUnavailable(RuntimeError):
 
 class InvalidModelOutput(RuntimeError):
     pass
+
+
+_transport: httpx.AsyncClient | None = None
+
+
+async def start_model_transport() -> None:
+    """Keep connections alive across clicks; the application owns their lifetime."""
+    global _transport
+    _transport = httpx.AsyncClient(timeout=httpx.Timeout(240.0, connect=10.0))
+
+
+async def close_model_transport() -> None:
+    global _transport
+    if _transport is not None:
+        await _transport.aclose()
+        _transport = None
+
+
+@asynccontextmanager
+async def model_transport():
+    if _transport is not None:
+        yield _transport
+    else:
+        # Scripts and isolated tests may run without the FastAPI lifespan.
+        async with httpx.AsyncClient(timeout=httpx.Timeout(240.0, connect=10.0)) as client:
+            yield client
 
 
 def _parse_json(content: str) -> dict[str, Any]:
@@ -32,7 +59,7 @@ def _parse_json(content: str) -> dict[str, Any]:
 
 class VLLMClient:
     def __init__(self) -> None:
-        self.last_metrics: dict[str, int] = {}
+        self.last_metrics: dict[str, Any] = {}
 
     async def chat_json(
         self, system: str, user: str, *, schema: dict[str, Any] | None = None,
@@ -64,7 +91,7 @@ class VLLMClient:
         }
         headers = {"Authorization": f"Bearer {settings.llm_api_key}"} if settings.llm_api_key else {}
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(240.0, connect=10.0)) as client:
+            async with model_transport() as client:
                 response = await client.post(
                     f"{settings.llm_base_url}/chat/completions",
                     json=payload,
@@ -118,26 +145,82 @@ class VLLMClient:
     async def translate_keyword_from_summary(
         self, paper_summary: str, clicked_token: str,
     ) -> dict[str, Any]:
-        """Translate a clicked token using only the stored paper summary as context."""
-        schema = {
-            "type": "object",
-            "properties": {
-                "term": {"type": "string"},
-                "meaning": {"type": "string"},
-            },
-            "required": ["term", "meaning"],
-            "additionalProperties": False,
+        """The caller resolves the exact source phrase; generate only its Korean meaning."""
+        payload = {
+            "model": settings.llm_model,
+            "messages": [
+                {"role": "system", "content":
+                    "Translate the term into Korean for this paper. "
+                    "Output only its short meaning, without explanation or formatting.\n"
+                    f"Paper: {paper_summary}"},
+                {"role": "user", "content": clicked_token},
+            ],
+            "temperature": 0,
+            # This is a safety cap, not a request to generate 32 tokens.
+            "max_tokens": 32,
+            "chat_template_kwargs": {"enable_thinking": False},
+            "stream": True,
+            "stream_options": {"include_usage": True},
         }
-        result = await self.chat_json(
-            "Translate clicked_token into a concise Korean gloss using paper_summary. "
-            "Copy clicked_token as term unless the summary clearly identifies a multiword "
-            "scientific term containing it. Return only JSON with term and meaning; no explanation.",
-            json.dumps({"paper_summary": paper_summary, "clicked_token": clicked_token},
-                       ensure_ascii=False),
-            schema=schema,
-            options={"temperature": 0, "num_predict": 32},
-        )
-        return result
+        headers = {"Authorization": f"Bearer {settings.llm_api_key}"} if settings.llm_api_key else {}
+        started = time.monotonic()
+        first_token_ms = None
+        content: list[str] = []
+        finish_reason = None
+        usage: dict[str, Any] = {}
+        self.last_metrics = {}
+        try:
+            async with model_transport() as client:
+                async with client.stream(
+                    "POST", f"{settings.llm_base_url}/chat/completions",
+                    json=payload, headers=headers,
+                ) as response:
+                    response.raise_for_status()
+                    async for line in response.aiter_lines():
+                        if not line.startswith("data:"):
+                            continue
+                        data = line[5:].strip()
+                        if data == "[DONE]":
+                            break
+                        if not data:
+                            continue
+                        event = json.loads(data)
+                        if event.get("error"):
+                            raise InvalidModelOutput("모델이 용어 뜻 생성을 완료하지 못했습니다.")
+                        if event.get("usage"):
+                            usage = event["usage"]
+                        for choice in event.get("choices", []):
+                            part = (choice.get("delta") or {}).get("content")
+                            if isinstance(part, str) and part:
+                                if first_token_ms is None:
+                                    first_token_ms = (time.monotonic() - started) * 1000
+                                content.append(part)
+                            if choice.get("finish_reason"):
+                                finish_reason = choice["finish_reason"]
+        except (httpx.HTTPError, ValueError, KeyError, TypeError, AttributeError) as exc:
+            raise ModelUnavailable(
+                "vLLM 용어 번역 요청에 실패했습니다. 모델 서버 연결과 로그를 확인하세요."
+            ) from exc
+        finally:
+            total_ms = (time.monotonic() - started) * 1000
+            self.last_metrics = {
+                "request_ms": round(total_ms, 2),
+                "first_token_ms": round(first_token_ms, 2) if first_token_ms is not None else None,
+                "after_first_token_ms": round(total_ms - first_token_ms, 2) if first_token_ms is not None else None,
+                "prompt_tokens": usage.get("prompt_tokens"),
+                "completion_tokens": usage.get("completion_tokens"),
+                "cached_prompt_tokens": (usage.get("prompt_tokens_details") or {}).get("cached_tokens"),
+                "reasoning_tokens": (usage.get("completion_tokens_details") or {}).get("reasoning_tokens"),
+                "finish_reason": finish_reason,
+            }
+        if finish_reason != "stop":
+            raise InvalidModelOutput("용어 뜻 생성이 중단되거나 출력 한도에 도달했습니다. 다시 시도해 주세요.")
+        meaning = "".join(content).strip().strip('"“”')
+        if (not meaning or len(meaning) > 100 or "\n" in meaning
+                or not re.search(r"[가-힣]", meaning)
+                or any(mark in meaning for mark in ("{", "}", "```", "<", ">"))):
+            raise InvalidModelOutput("모델이 짧은 한국어 용어 뜻을 반환하지 않았습니다.")
+        return {"term": clicked_token, "meaning": meaning}
 
     async def search_query(self, korean_question: str) -> str:
         result = await self.chat_json(

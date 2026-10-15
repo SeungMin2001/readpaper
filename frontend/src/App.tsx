@@ -216,6 +216,7 @@ export default function App() {
     }
     if (!paperId || wordRequests.current.has(word.id)) return
 
+    const clickedAt = performance.now()
     setPendingWordIds((previous) => new Set(previous).add(word.id))
     const request = api.translateWord(paperId, word.id).then((result) => {
       const unit: WordGloss = {
@@ -231,7 +232,7 @@ export default function App() {
           ...Object.fromEntries(unit.word_ids.map((id) => [id, unit])),
         },
       } : previous)
-      revealGloss(unit, word, result.elapsed_ms)
+      revealGloss(unit, word, performance.now() - clickedAt)
       return unit
     }).catch((error: Error) => {
       setNotice(error.message)

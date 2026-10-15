@@ -16,10 +16,11 @@ from pydantic import BaseModel, Field
 
 from . import db
 from .config import settings
-from .llm import InvalidModelOutput, ModelUnavailable, VLLMClient, validate_keyword_gloss
+from .llm import InvalidModelOutput, ModelUnavailable, VLLMClient, close_model_transport, start_model_transport
 from .pdf import extract_pdf
 from .rag import build_chunks, retrieve
 from .sources import collect_external_sources
+from .terms import gloss_cache_key, resolve_term
 
 
 app = FastAPI(title="Readpaper API", version="0.1.0")
@@ -32,7 +33,7 @@ _gloss_locks_guard = asyncio.Lock()
 
 @asynccontextmanager
 async def _gloss_request_lock(key: tuple[str, str]):
-    """Deduplicate concurrent requests for the same source word."""
+    """Deduplicate identical model inputs, including terms at different locations."""
     async with _gloss_locks_guard:
         lock = _gloss_locks.setdefault(key, asyncio.Lock())
         _gloss_lock_users[key] = _gloss_lock_users.get(key, 0) + 1
@@ -123,11 +124,13 @@ async def startup() -> None:
     db.init_db()
     db.cleanup_expired()
     db.fail_interrupted_jobs()
+    await start_model_transport()
     _cleanup_task = asyncio.create_task(_cleanup_loop())
 
 
 @app.on_event("shutdown")
 async def shutdown() -> None:
+    await close_model_transport()
     if _cleanup_task:
         _cleanup_task.cancel()
         try:
@@ -415,6 +418,7 @@ async def translate_word(paper_id: str, body: WordTranslationRequest,
 
 
 async def _translate_word(paper_id: str, word_id: str) -> dict[str, Any]:
+    started = time.monotonic()
     paper = db.get_paper(paper_id)
     if paper is None:
         raise HTTPException(status_code=404, detail="논문을 찾을 수 없습니다.")
@@ -425,85 +429,84 @@ async def _translate_word(paper_id: str, word_id: str) -> dict[str, Any]:
     word = known_words.get(word_id)
     if word is None:
         raise HTTPException(status_code=404, detail="선택한 단어를 논문에서 찾을 수 없습니다.")
-
-    cached = data.get("word_glosses", {}).get(word_id)
-    if cached:
-        return cached | {
-            "cached": True, "elapsed_ms": 0,
-            "activity": db.list_paper_activity(paper_id),
-        }
-
-    sentences = data.get("sentences", [])
-    sentence_index = next(
-        (index for index, item in enumerate(sentences) if item["id"] == word["sentence_id"]), None,
+    sentence = next(
+        (item for item in data.get("sentences", []) if item["id"] == word["sentence_id"]), None,
     )
-    if sentence_index is None:
+    if sentence is None:
         raise HTTPException(status_code=422, detail="단어가 속한 문장을 찾을 수 없습니다.")
-    sentence = sentences[sentence_index]
-    tokens = [known_words[word_id]["text"] for word_id in sentence["word_ids"]]
-    focus_index = sentence["word_ids"].index(word_id)
+    tokens = [known_words[item]["text"] for item in sentence["word_ids"]]
+    selected = resolve_term(tokens, sentence["word_ids"].index(word_id))
     paper_summary = data.get("paper_summary")
     if not paper_summary:
-        raise HTTPException(
-            status_code=503,
-            detail="논문 핵심 요약을 준비하고 있습니다. 잠시 후 다시 시도해 주세요.",
-        )
-
-    started = time.monotonic()
-    async with _gloss_request_lock((paper_id, word_id)):
-        lock_wait_ms = round((time.monotonic() - started) * 1000)
-        # Another click may have completed while this request waited for the local model.
-        latest = db.get_paper(paper_id, touch=False)
-        cached = (latest or {}).get("data", {}).get("word_glosses", {}).get(word_id)
-        if cached:
-            return cached | {
-                "cached": True, "elapsed_ms": 0,
-                "activity": db.list_paper_activity(paper_id),
-            }
-        model = VLLMClient()
-        try:
-            result = await model.translate_keyword_from_summary(paper_summary, word["text"])
-            result = validate_keyword_gloss(result, tokens, focus_index)
-        except (ModelUnavailable, InvalidModelOutput) as exc:
-            raise HTTPException(status_code=503, detail=str(exc)) from exc
-        model_request_ms = round((time.monotonic() - started) * 1000) - lock_wait_ms
-        model_metrics = getattr(model, "last_metrics", {})
-
-        start, end = result.get("start"), result.get("end")
-        meaning = result.get("meaning")
-        if (type(start) is not int or type(end) is not int or start < 0 or end <= start
-                or end > len(tokens) or not start <= focus_index < end
-                or not isinstance(meaning, str) or not meaning.strip() or len(meaning) > 100):
-            raise HTTPException(status_code=502, detail="용어 번역 결과를 검증할 수 없습니다.")
-
-        word_ids = sentence["word_ids"][start:end]
-        clean_term = [re.sub(r"^[\W_]+|[\W_]+$", "", token) for token in tokens[start:end]]
-        unit = {
-            "word_ids": word_ids,
-            "original": " ".join(token for token in clean_term if token),
-            "meaning": meaning.strip(),
-            "sentence_id": sentence["id"],
-            "context_source": "paper_summary",
-        }
-        db.save_word_gloss(paper_id, word_ids, unit)
-
-    elapsed_ms = round((time.monotonic() - started) * 1000)
-    db.add_paper_activity(
-        paper_id, f"용어 뜻 생성: {unit['original']} · {elapsed_ms / 1000:.1f}초", "success",
+        raise HTTPException(status_code=503, detail="논문 핵심 요약을 준비하고 있습니다. 잠시 후 다시 시도해 주세요.")
+    key = gloss_cache_key(
+        paper_summary, selected["term"], model=settings.llm_model, endpoint=settings.llm_base_url,
     )
+    word_ids = sentence["word_ids"][selected["start"]:selected["end"]]
+    context_ms = (time.monotonic() - started) * 1000
+    cached = data.get("word_glosses", {}).get(word_id)
+    meaning = cached["meaning"] if cached and cached.get("translation_key") == key else None
+    cache_source = "position" if meaning else "term"
+    if meaning is None:
+        meaning = db.get_term_gloss(paper_id, key)
+    model_metrics: dict[str, Any] = {}
+    lock_wait_ms = model_request_ms = 0.0
+    if meaning is None:
+        lock_started = time.monotonic()
+        async with _gloss_request_lock((paper_id, key)):
+            lock_wait_ms = (time.monotonic() - lock_started) * 1000
+            meaning = db.get_term_gloss(paper_id, key)
+            cache_source = "shared_request" if meaning is not None else "miss"
+            if meaning is None:
+                model = VLLMClient()
+                model_started = time.monotonic()
+                try:
+                    result = await model.translate_keyword_from_summary(paper_summary, selected["term"])
+                    meaning = result.get("meaning")
+                    if not isinstance(meaning, str) or not meaning.strip() or len(meaning) > 100:
+                        raise InvalidModelOutput("용어 뜻이 없거나 너무 깁니다.")
+                    meaning = meaning.strip()
+                except (ModelUnavailable, InvalidModelOutput) as exc:
+                    raise HTTPException(status_code=503, detail=str(exc)) from exc
+                model_request_ms = (time.monotonic() - model_started) * 1000
+                model_metrics = getattr(model, "last_metrics", {})
+            unit = {
+                "word_ids": word_ids, "original": selected["term"], "meaning": meaning,
+                "sentence_id": sentence["id"], "context_source": "paper_summary",
+                "translation_key": key,
+            }
+            if not db.save_word_gloss(paper_id, word_ids, unit, cache_key=key):
+                raise HTTPException(status_code=404, detail="논문이 만료되었습니다.")
+    else:
+        # Bind a shared meaning to this occurrence, never to an earlier page's word IDs.
+        unit = {
+            "word_ids": word_ids, "original": selected["term"], "meaning": meaning,
+            "sentence_id": sentence["id"], "context_source": "paper_summary",
+            "translation_key": key,
+        }
+        if cache_source != "position" and not db.save_word_gloss(paper_id, word_ids, unit):
+            raise HTTPException(status_code=404, detail="논문이 만료되었습니다.")
+    if cache_source == "miss":
+        db.add_paper_activity(
+            paper_id, f"용어 뜻 생성: {unit['original']} · {model_request_ms / 1000:.1f}초", "success",
+        )
+    activity = db.list_paper_activity(paper_id)
+    elapsed_ms = round((time.monotonic() - started) * 1000, 2)
     return unit | {
-        "cached": False, "elapsed_ms": elapsed_ms,
+        "cached": cache_source != "miss", "elapsed_ms": elapsed_ms,
         "timing": {
-            "provider": "vllm",
-            "model": settings.llm_model,
-            "context_ms": 0,
-            "lock_wait_ms": lock_wait_ms,
-            "model_request_ms": model_request_ms,
+            "provider": "vllm", "model": settings.llm_model, "cache": cache_source,
+            "server_ms": elapsed_ms, "context_ms": round(context_ms, 2),
+            "lock_wait_ms": round(lock_wait_ms, 2), "model_request_ms": round(model_request_ms, 2),
             "provider_request_ms": model_metrics.get("request_ms"),
+            "first_token_ms": model_metrics.get("first_token_ms"),
+            "after_first_token_ms": model_metrics.get("after_first_token_ms"),
             "prompt_tokens": model_metrics.get("prompt_tokens"),
             "generated_tokens": model_metrics.get("completion_tokens"),
+            "cached_prompt_tokens": model_metrics.get("cached_prompt_tokens"),
+            "reasoning_tokens": model_metrics.get("reasoning_tokens"),
         },
-        "activity": db.list_paper_activity(paper_id),
+        "activity": activity,
     }
 
 

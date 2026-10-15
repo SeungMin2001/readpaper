@@ -54,6 +54,12 @@ def init_db() -> None:
                 error TEXT,
                 updated_at REAL NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS term_glosses (
+                paper_id TEXT NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
+                cache_key TEXT NOT NULL,
+                meaning TEXT NOT NULL,
+                PRIMARY KEY (paper_id, cache_key)
+            );
         """)
 
 
@@ -185,7 +191,17 @@ def merge_paper_data(paper_id: str, updates: dict[str, Any]) -> bool:
     return True
 
 
-def save_word_gloss(paper_id: str, word_ids: list[str], gloss: dict[str, Any]) -> bool:
+def get_term_gloss(paper_id: str, cache_key: str) -> str | None:
+    with connect() as db:
+        row = db.execute(
+            "SELECT meaning FROM term_glosses WHERE paper_id = ? AND cache_key = ?",
+            (paper_id, cache_key),
+        ).fetchone()
+    return row["meaning"] if row else None
+
+
+def save_word_gloss(paper_id: str, word_ids: list[str], gloss: dict[str, Any],
+                    *, cache_key: str | None = None) -> bool:
     with connect() as db:
         db.execute("BEGIN IMMEDIATE")
         row = db.execute("SELECT data_json FROM papers WHERE id = ?", (paper_id,)).fetchone()
@@ -199,6 +215,12 @@ def save_word_gloss(paper_id: str, word_ids: list[str], gloss: dict[str, Any]) -
             "UPDATE papers SET data_json = ? WHERE id = ?",
             (json.dumps(data, ensure_ascii=False), paper_id),
         )
+        if cache_key is not None:
+            db.execute(
+                "INSERT INTO term_glosses (paper_id, cache_key, meaning) VALUES (?, ?, ?) "
+                "ON CONFLICT(paper_id, cache_key) DO UPDATE SET meaning = excluded.meaning",
+                (paper_id, cache_key, gloss["meaning"]),
+            )
     return True
 
 

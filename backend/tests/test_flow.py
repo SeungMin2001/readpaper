@@ -65,7 +65,7 @@ class FakeVLLM:
         self.keyword_calls += 1
         self.last_summary = paper_summary
         self.last_clicked_token = clicked_token
-        if clicked_token == "Reinforcement":
+        if clicked_token == "Reinforcement learning":
             return {"term": "Reinforcement learning", "meaning": "강화학습"}
         return {"term": clicked_token, "meaning": "문맥상 뜻"}
 
@@ -162,7 +162,7 @@ class ReadpaperFlowTests(unittest.TestCase):
                     self.assertFalse(cached.json()["cached"])
                     self.assertEqual(fake_model.keyword_calls, 1)
                     self.assertEqual(fake_model.last_summary, preparation.json()["summary"])
-                    self.assertEqual(fake_model.last_clicked_token, "Reinforcement")
+                    self.assertEqual(fake_model.last_clicked_token, "Reinforcement learning")
                     client.post(f"/api/papers/{paper_id}/gloss-preparation")
                     self.assertEqual(fake_model.keyword_calls, 1)
 
@@ -228,7 +228,7 @@ class ReadpaperFlowTests(unittest.TestCase):
                     self.assertEqual(first_unit["meaning"], "강화학습")
                     self.assertEqual(len(first_unit["word_ids"]), 2)
                     self.assertIn("timing", first_unit)
-                    self.assertEqual(first_unit["timing"]["context_ms"], 0)
+                    self.assertGreaterEqual(first_unit["timing"]["context_ms"], 0)
                     self.assertIsNone(first_unit["timing"]["provider_request_ms"])
                     self.assertEqual(fake_model.last_summary, summary)
                     cached_gloss = client.post(

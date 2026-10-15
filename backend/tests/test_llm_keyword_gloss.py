@@ -2,13 +2,13 @@ import json
 import sys
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 import httpx
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from readpaper.llm import InvalidModelOutput, VLLMClient, validate_keyword_gloss  # noqa: E402
+from readpaper.llm import InvalidModelOutput, ModelUnavailable, VLLMClient, validate_keyword_gloss  # noqa: E402
 from readpaper.config import settings  # noqa: E402
 
 
@@ -43,23 +43,61 @@ class KeywordGlossTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.last_metrics["prompt_tokens"], 400)
         self.assertEqual(client.last_metrics["completion_tokens"], 20)
 
-    async def test_translation_sends_only_summary_and_clicked_token(self):
+    async def stream_gloss(self, parts, *, finish="stop", status=200, requests=None):
+        events = [{"choices": [{"delta": {"content": part}}]} for part in parts]
+        if finish is not None:
+            events.append({"choices": [{"delta": {}, "finish_reason": finish}]})
+        events.append({"choices": [], "usage": {
+            "prompt_tokens": 75, "completion_tokens": 3,
+            "prompt_tokens_details": {"cached_tokens": 64},
+            "completion_tokens_details": {"reasoning_tokens": 0},
+        }})
+        wire = "".join("data: " + json.dumps(event, ensure_ascii=False) + "\n\n" for event in events)
+        wire += "data: [DONE]\n\n"
+
+        def respond(request):
+            if requests is not None:
+                requests.append(json.loads(request.content))
+            return httpx.Response(status, text=wire, headers={"Content-Type": "text/event-stream"})
+
+        real_client = httpx.AsyncClient
         client = VLLMClient()
-        client.chat_json = AsyncMock(return_value={
-            "term": "Reinforcement learning", "meaning": "강화학습",
-        })
+        with patch("readpaper.llm.httpx.AsyncClient", side_effect=lambda **kwargs: real_client(
+            transport=httpx.MockTransport(respond), **kwargs,
+        )):
+            result = await client.translate_keyword_from_summary(
+                "The paper studies reinforcement learning for robotic control.", "reinforcement learning",
+            )
+        return result, client.last_metrics
 
-        result = await client.translate_keyword_from_summary(
-            "The paper studies reinforcement learning for robotic control.",
-            "Reinforcement",
-        )
+    async def test_translation_generates_only_meaning_with_reusable_prefix(self):
+        requests = []
+        result, metrics = await self.stream_gloss(["강화", "학습"], requests=requests)
+        self.assertEqual(result, {"term": "reinforcement learning", "meaning": "강화학습"})
+        request = requests[0]
+        self.assertNotIn("response_format", request)
+        self.assertTrue(request["stream"])
+        self.assertFalse(request["chat_template_kwargs"]["enable_thinking"])
+        self.assertEqual(request["messages"][1]["content"], "reinforcement learning")
+        self.assertIn("robotic control", request["messages"][0]["content"])
+        self.assertNotIn("start", request["messages"][0]["content"])
+        self.assertEqual(metrics["completion_tokens"], 3)
+        self.assertEqual(metrics["cached_prompt_tokens"], 64)
+        self.assertEqual(metrics["reasoning_tokens"], 0)
+        self.assertGreaterEqual(metrics["request_ms"], metrics["first_token_ms"])
 
-        self.assertEqual(result["meaning"], "강화학습")
-        args, kwargs = client.chat_json.await_args
-        request = json.loads(args[1])
-        self.assertEqual(set(request), {"paper_summary", "clicked_token"})
-        self.assertEqual(request["clicked_token"], "Reinforcement")
-        self.assertEqual(kwargs["options"]["num_predict"], 32)
+    async def test_rejects_partial_and_invalid_glosses(self):
+        for parts, finish in [(["강화"], "length"), (["강화학습"], None),
+                              (["English only"], "stop"), ([""], "stop"),
+                              (['{"meaning":"강화학습"}'], "stop"),
+                              (["강화학습\n이 용어는"], "stop")]:
+            with self.subTest(parts=parts, finish=finish):
+                with self.assertRaises(InvalidModelOutput):
+                    await self.stream_gloss(parts, finish=finish)
+
+    async def test_reports_model_http_error(self):
+        with self.assertRaises(ModelUnavailable):
+            await self.stream_gloss([], status=503)
 
     def test_matches_repeated_term_at_clicked_occurrence(self):
         result = validate_keyword_gloss(
