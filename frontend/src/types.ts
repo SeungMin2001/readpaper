@@ -1,95 +1,115 @@
 export type Word = {
-  id: string
-  text: string
-  page: number
-  x0: number
-  y0: number
-  x1: number
-  y1: number
-  sentence_id: string
-}
+  id: string;
+  text: string;
+  page: number;
+  x0: number;
+  y0: number;
+  x1: number;
+  y1: number;
+  sentence_id: string;
+};
 
 export type PaperPage = {
-  index: number
-  width: number
-  height: number
-  words: Word[]
-}
+  index: number;
+  width: number;
+  height: number;
+  words: Word[];
+};
 
 export type Sentence = {
-  id: string
-  page: number
-  text: string
-  word_ids: string[]
-}
+  id: string;
+  page: number;
+  text: string;
+  word_ids: string[];
+};
 
 export type WordGloss = {
-  word_ids: string[]
-  original: string
-  meaning: string
-  sentence_id: string
-  context_source?: 'paper_summary'
-}
+  word_ids: string[];
+  original: string;
+  meaning: string;
+  sentence_id: string;
+  context_source?: "paper_summary";
+};
 
 export type GlossPreparation = {
-  status: 'pending' | 'queued' | 'running' | 'completed' | 'failed'
-  stage: 'pending' | 'queued' | 'summarizing' | 'completed' | 'failed'
-  total: number
-  ready: number
-  failed: number
-  error: string | null
-  summary: string | null
-  word_glosses: Record<string, WordGloss>
-}
+  status: "pending" | "queued" | "running" | "completed" | "failed";
+  stage: "pending" | "queued" | "summarizing" | "completed" | "failed";
+  total: number;
+  ready: number;
+  failed: number;
+  error: string | null;
+  summary: string | null;
+  word_glosses: Record<string, WordGloss>;
+};
 
 export type Source = {
-  id: string
-  kind: 'paper' | 'referenced' | 'related' | 'citing' | 'recent' | 'background'
-  title: string
-  content_scope?: 'full_text' | 'abstract' | 'metadata' | 'background'
-  openalex_id?: string | null
-  doi?: string | null
-  publication_date?: string | null
-  url: string | null
-  year?: number | null
-  authors?: string[]
-  page?: number
-  excerpt?: string
-}
+  id: string;
+  kind: "paper" | "referenced" | "related" | "citing" | "recent" | "background";
+  title: string;
+  content_scope?: "full_text" | "abstract" | "metadata" | "background";
+  openalex_id?: string | null;
+  doi?: string | null;
+  publication_date?: string | null;
+  url: string | null;
+  year?: number | null;
+  authors?: string[];
+  page?: number;
+  excerpt?: string;
+  document_id?: string;
+  sentence_ids?: string[];
+  fulltext_status?: string;
+  fulltext_error?: string;
+  referenced_works?: string[];
+};
 
 export type VocabularyItem = {
-  id: number
-  paper_title: string
-  term: string
-  meaning: string
-  source_sentence: string
-  created_at: number
-}
+  id: number;
+  paper_title: string;
+  term: string;
+  meaning: string;
+  source_sentence: string;
+  created_at: number;
+};
 
 export type Answer = {
-  answer: string
-  citations: string[]
-  sources: Source[]
-}
+  answer: string;
+  citations: string[];
+  sources: Source[];
+};
 
 export type ActivityEvent = {
-  id: number
-  created_at: number
-  state: 'info' | 'success' | 'warning' | 'error'
-  message: string
-}
+  id: number;
+  created_at: number;
+  state: "info" | "success" | "warning" | "error";
+  message: string;
+};
 
 export type Paper = {
-  id: string
-  title: string
-  status: 'processing' | 'ready' | 'failed'
-  progress: number
-  error: string | null
-  pages?: PaperPage[]
-  sentences?: Sentence[]
-  word_glosses?: Record<string, WordGloss>
-  sources_ready?: boolean
-  sources?: Source[]
-  source_warnings?: string[]
-  activity?: ActivityEvent[]
-}
+  id: string;
+  title: string;
+  status: "processing" | "ready" | "failed";
+  progress: number;
+  error: string | null;
+  pages?: PaperPage[];
+  sentences?: Sentence[];
+  word_glosses?: Record<string, WordGloss>;
+  rag_index?: {
+    status: string;
+    chunks: number;
+    dimensions: number;
+    fulltext_documents?: number;
+  };
+  sources_ready?: boolean;
+  sources?: Source[];
+  source_warnings?: string[];
+  activity?: ActivityEvent[];
+};
+
+export type Attachment = {
+  kind: "text" | "figure";
+  page: number;
+  word_ids: string[];
+  rect?: number[];
+  preview: string;
+  image?: string;
+};

@@ -18,6 +18,7 @@ class Settings:
     unpaywall_email: str = os.getenv("READPAPER_UNPAYWALL_EMAIL", "")
     crossref_email: str = os.getenv("READPAPER_CROSSREF_EMAIL", "")
     wikipedia_url: str = os.getenv("READPAPER_WIKIPEDIA_URL", "https://en.wikipedia.org/w/api.php")
+    embedding_model: str = os.getenv("READPAPER_EMBEDDING_MODEL", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
     max_upload_bytes: int = 25 * 1024 * 1024
     paper_ttl_seconds: int = 24 * 60 * 60
     dev_mode: bool = os.getenv("READPAPER_DEV_MODE") == "1"

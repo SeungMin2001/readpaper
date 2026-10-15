@@ -1,5 +1,6 @@
 import json
 import sqlite3
+import shutil
 import time
 from pathlib import Path
 from typing import Any
@@ -65,10 +66,14 @@ def init_db() -> None:
 
 def cleanup_expired() -> None:
     with connect() as db:
-        db.execute(
-            "DELETE FROM papers WHERE last_accessed < ?",
-            (time.time() - settings.paper_ttl_seconds,),
-        )
+        cutoff = time.time() - settings.paper_ttl_seconds
+        expired = db.execute("SELECT id FROM papers WHERE last_accessed < ?", (cutoff,)).fetchall()
+        db.execute("DELETE FROM papers WHERE last_accessed < ?", (cutoff,))
+    root = (settings.data_dir / 'papers').resolve()
+    for row in expired:
+        directory = (root / row['id']).resolve()
+        if directory.parent == root:
+            shutil.rmtree(directory, ignore_errors=True)
 
 
 def fail_interrupted_jobs() -> None:

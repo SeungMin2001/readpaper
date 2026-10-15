@@ -3,12 +3,15 @@ import base64
 import hashlib
 import hmac
 import logging
+import math
 import re
 import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
+
+import pymupdf
 
 from fastapi import BackgroundTasks, Depends, FastAPI, File, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse
@@ -18,7 +21,8 @@ from . import db
 from .config import settings
 from .llm import InvalidModelOutput, ModelUnavailable, VLLMClient, close_model_transport, start_model_transport
 from .pdf import extract_pdf
-from .rag import build_chunks, retrieve
+from .rag import INDEX_VERSION, build_chunks, build_index, retrieve
+from .fulltext import collect_fulltext
 from .sources import collect_external_sources
 from .terms import gloss_cache_key, resolve_term
 
@@ -55,8 +59,22 @@ class LoginRequest(BaseModel):
     password: str
 
 
+class Attachment(BaseModel):
+    kind: Literal['text', 'figure']
+    page: int = Field(ge=1, le=100)
+    word_ids: list[str] = Field(default_factory=list, max_length=300)
+    rect: list[float] = Field(default_factory=list, max_length=4)
+
+
+class ChatMessage(BaseModel):
+    role: Literal['user', 'assistant']
+    content: str = Field(max_length=2000)
+
+
 class QuestionRequest(BaseModel):
-    question: str = Field(min_length=3, max_length=1000)
+    question: str = Field(min_length=1, max_length=1000)
+    attachments: list[Attachment] = Field(default_factory=list, max_length=4)
+    history: list[ChatMessage] = Field(default_factory=list, max_length=6)
 
 
 class WordTranslationRequest(BaseModel):
@@ -214,15 +232,27 @@ async def process_paper(paper_id: str) -> None:
         }
         db.add_paper_activity(
             paper_id,
-            "수집 완료: 참고문헌 {referenced}편 · 관련 연구 {related}편 · 피인용 {citing}편".format(**source_counts),
+            "서지 조회 완료: 참고문헌 {referenced}편 · 관련 연구 {related}편 · 피인용 {citing}편".format(**source_counts),
             "success",
         )
         for warning in warnings:
             db.add_paper_activity(paper_id, warning, "warning")
 
+        db.set_paper(paper_id, progress=50)
+        directory = settings.data_dir / 'papers' / paper_id
+        external = await collect_fulltext(external, directory / 'sources', report_collection_event)
+        db.merge_paper_data(paper_id, {'external_sources': external})
         db.set_paper(paper_id, progress=75)
+        db.add_paper_activity(paper_id, '본문 청킹 및 다국어 임베딩 생성 중')
         chunks = build_chunks(payload["sentences"], external, payload["title"])
         db.merge_paper_data(paper_id, {"chunks": chunks})
+        def report_index_progress(done: int, total: int) -> None:
+            db.add_paper_activity(paper_id, f'임베딩 생성 {done}/{total}개')
+            db.set_paper(paper_id, progress=75 + int(24 * done / total))
+        index = await asyncio.to_thread(build_index, chunks, directory / 'index', report_index_progress)
+        index['fulltext_documents'] = sum(source.get('fulltext_status') == 'ready' for source in external)
+        db.merge_paper_data(paper_id, {'rag_index': index})
+        db.add_paper_activity(paper_id, f"검색 색인 저장: {len(chunks)}개 청크 · {index['dimensions']}차원", 'success')
         db.set_paper(paper_id, status="ready", progress=100, error="")
         db.add_paper_activity(paper_id, "원문·문헌·검색 문맥 준비 완료.", "success")
     except Exception:
@@ -319,6 +349,12 @@ async def upload_paper(background: BackgroundTasks, file: UploadFile = File(...)
     content_hash = hashlib.sha256(data).hexdigest()
     cached = db.find_cached_paper(content_hash)
     if cached:
+        directory = settings.data_dir / 'papers' / cached['id']
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / 'original.pdf').write_bytes(data)
+        if cached['data'].get('rag_index', {}).get('version') != INDEX_VERSION or cached['data'].get('rag_index', {}).get('model') != settings.embedding_model or not (directory / 'index' / 'vectors.npy').is_file():
+            db.set_paper(cached['id'], status='processing', progress=0)
+            background.add_task(process_paper, cached['id'])
         _start_gloss_preparation(cached["id"], cached["data"], background)
         return {"paper_id": cached["id"], "status": "ready", "cached": True}
     try:
@@ -328,6 +364,9 @@ async def upload_paper(background: BackgroundTasks, file: UploadFile = File(...)
     parsed["content_hash"] = content_hash
     parsed["chunks"] = build_chunks(parsed["sentences"], [], parsed["title"])
     paper_id = uuid.uuid4().hex
+    directory = settings.data_dir / 'papers' / paper_id
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / 'original.pdf').write_bytes(data)
     db.create_paper(paper_id, parsed["title"], parsed)
     db.claim_gloss_preparation(paper_id, 0)
     background.add_task(prepare_new_paper, paper_id)
@@ -348,10 +387,11 @@ def get_paper(paper_id: str, _user: str = Depends(require_user)) -> dict[str, An
     data = paper["data"]
     sources_ready = "external_sources" in data
     response["sources_ready"] = sources_ready
+    response["rag_index"] = data.get("rag_index")
     if sources_ready:
         response.update({
             "sources": [
-                {key: value for key, value in source.items() if key != "text"}
+                {key: value for key, value in source.items() if key not in {"text", "sentences"}}
                 for source in data["external_sources"]
             ],
             "source_warnings": data.get("source_warnings", []),
@@ -404,8 +444,8 @@ def retry_paper(paper_id: str, background: BackgroundTasks,
     paper = db.get_paper(paper_id)
     if paper is None:
         raise HTTPException(status_code=404, detail="논문 분석 결과가 없습니다.")
-    if paper["status"] != "failed":
-        raise HTTPException(status_code=409, detail="실패한 분석만 다시 시도할 수 있습니다.")
+    if paper["status"] == "processing":
+        raise HTTPException(status_code=409, detail="문헌 수집이 이미 진행 중입니다.")
     db.set_paper(paper_id, status="processing", progress=0, error="")
     background.add_task(process_paper, paper_id)
     return {"status": "processing"}
@@ -510,26 +550,103 @@ async def _translate_word(paper_id: str, word_id: str) -> dict[str, Any]:
     }
 
 
+def selection_contexts(paper: dict, attachments: list[Attachment]) -> list[dict]:
+    contexts = []
+    if sum(item.kind == 'figure' for item in attachments) > 2:
+        raise HTTPException(422, '그림은 한 번에 2개까지 첨부할 수 있습니다.')
+    pages = paper['data']['pages']
+    for index, attachment in enumerate(attachments):
+        if attachment.page > len(pages):
+            raise HTTPException(422, '선택한 페이지가 없습니다.')
+        page = pages[attachment.page - 1]
+        by_id = {word['id']: word for word in page['words']}
+        if any(word_id not in by_id for word_id in attachment.word_ids):
+            raise HTTPException(422, '선택한 단어가 이 페이지에 없습니다.')
+        words = [word for word in page['words'] if word['id'] in attachment.word_ids]
+        context = {'id': f'selection-{index}', 'document_id': 'paper', 'kind': 'paper',
+                   'title': paper['title'], 'page': attachment.page, 'url': None,
+                   'content_scope': 'full_text'}
+        if attachment.kind == 'figure':
+            rect = attachment.rect
+            if (len(rect) != 4 or not all(math.isfinite(v) for v in rect)
+                    or not 0 <= rect[0] < rect[2] <= page['width']
+                    or not 0 <= rect[1] < rect[3] <= page['height']
+                    or rect[2] - rect[0] < 5 or rect[3] - rect[1] < 5):
+                raise HTTPException(422, '올바른 그림 영역을 선택해 주세요.')
+            path = settings.data_dir / 'papers' / paper['id'] / 'original.pdf'
+            if not path.exists():
+                raise HTTPException(409, '그림 첨부를 위해 PDF를 다시 업로드해 주세요.')
+            with pymupdf.open(path) as document:
+                scale = min(1.5, 1024 / max(rect[2]-rect[0], rect[3]-rect[1]))
+                pix = document[attachment.page - 1].get_pixmap(matrix=pymupdf.Matrix(scale, scale), clip=pymupdf.Rect(rect))
+                context['image_data'] = 'data:image/png;base64,' + base64.b64encode(pix.tobytes('png')).decode()
+            words = [word for word in page['words'] if rect[0] <= (word['x0']+word['x1'])/2 <= rect[2]
+                     and rect[1] <= (word['y0']+word['y1'])/2 <= rect[3]]
+            context['rect'] = rect
+        if not words and attachment.kind == 'text':
+            raise HTTPException(422, '첨부할 단어나 문장을 선택해 주세요.')
+        words.sort(key=lambda word: (int(word['sentence_id'][1:]), int(word['id'][1:])))
+        context['text'] = ' '.join(word['text'] for word in words) or '사용자가 선택한 그림 영역 (이미지 참조)'
+        context['sentence_ids'] = list(dict.fromkeys(word['sentence_id'] for word in words))
+        contexts.append(context)
+    return contexts
+
+
+@app.get('/api/papers/{paper_id}/sources/{source_id}/pdf')
+def source_pdf(paper_id: str, source_id: str, _user: str = Depends(require_user)):
+    paper = db.get_paper(paper_id)
+    if not paper:
+        raise HTTPException(404, '논문이 없습니다.')
+    directory = settings.data_dir / 'papers' / paper_id
+    if source_id == 'paper':
+        path = directory / 'original.pdf'
+    else:
+        source = next((item for item in paper['data'].get('external_sources', []) if item['id'] == source_id), None)
+        if not source or not source.get('pdf_file'):
+            raise HTTPException(404, '수집된 PDF가 없습니다.')
+        path = directory / 'sources' / Path(source['pdf_file']).name
+    if not path.is_file():
+        raise HTTPException(404, 'PDF가 없습니다.')
+    return FileResponse(path, media_type='application/pdf')
+
+
 @app.post("/api/papers/{paper_id}/ask")
 async def ask_paper(paper_id: str, body: QuestionRequest,
                     _user: str = Depends(require_user)) -> dict[str, Any]:
     paper = db.get_paper(paper_id)
-    if paper is None or paper["status"] != "ready":
-        raise HTTPException(status_code=404, detail="읽을 준비가 된 논문이 없습니다.")
+    if paper is None:
+        raise HTTPException(404, '논문이 없습니다.')
+    if paper['status'] != 'ready' or not paper['data'].get('rag_index'):
+        raise HTTPException(409, '문헌 검색 준비를 완료한 뒤 질문해 주세요.')
     model = VLLMClient()
+    selected_context = selection_contexts(paper, body.attachments)
+    history = [{'role': message.role, 'content': message.content[:800]} for message in body.history[-4:]]
+    # History is conversational context, never indexed evidence.
+    import json
+    question = json.dumps({'question': body.question, 'history': history,
+                           'selected_text': [item['text'][:300] for item in selected_context]}, ensure_ascii=False)
     try:
-        english_query = await model.search_query(body.question)
-        contexts = retrieve(english_query, paper["data"]["chunks"])
+        english_query = await model.search_query(question)
+        contexts = await asyncio.to_thread(retrieve, english_query + ' ' + body.question,
+                                           paper['data']['chunks'], 6,
+                                           settings.data_dir / 'papers' / paper_id / 'index')
+        contexts = selected_context + contexts[:6 - len(selected_context)]
         if not contexts:
-            return {"answer": "수집한 자료에서 이 질문의 근거를 찾지 못했습니다.", "citations": [], "sources": []}
-        result = await model.answer(body.question, contexts)
-        selected = [
-            {key: value for key, value in source.items() if key != "text"}
-            | {"excerpt": source["text"][:350]}
-            for source in contexts if source["id"] in result["citations"]
-        ]
-        return result | {"sources": selected}
-    except (ModelUnavailable, InvalidModelOutput) as exc:
+            return {'answer': '수집한 자료에서 이 질문의 근거를 찾지 못했습니다.', 'citations': [], 'sources': []}
+        result = await model.answer(question, contexts)
+        selected = []
+        for source in contexts:
+            if source['id'] not in result['citations']:
+                continue
+            item = {key: value for key, value in source.items() if key not in {'text', 'image_data'}}
+            item['excerpt'] = source['text']
+            document_id = source.get('document_id', '')
+            external = next((s for s in paper['data'].get('external_sources', []) if s['id'] == document_id), {})
+            if document_id == 'paper' or external.get('pdf_file'):
+                item['url'] = f'/api/papers/{paper_id}/sources/{document_id}/pdf' + (f"#page={source['page']}" if source.get('page') else '')
+            selected.append(item)
+        return result | {'sources': selected}
+    except (ModelUnavailable, InvalidModelOutput, ValueError, OSError) as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 

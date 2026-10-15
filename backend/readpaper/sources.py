@@ -99,6 +99,7 @@ def _paper_source(work: dict[str, Any], kind: str, index: int) -> dict[str, Any]
     return {
         "id": f"external-{index}", "kind": kind,
         "openalex_id": work.get("id"), "doi": work.get("doi"),
+        "referenced_works": work.get("referenced_works") or [],
         "title": work["display_name"],
         "text": abstract, "content_scope": "abstract" if abstract else "metadata", "url": url,
         "year": work.get("publication_year"), "publication_date": work.get("publication_date"),

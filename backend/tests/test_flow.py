@@ -87,6 +87,12 @@ async def fake_sources(title, doi, keywords, on_event=None):
 
 
 class ReadpaperFlowTests(unittest.TestCase):
+    def setUp(self):
+        from rag_fixtures import fake_embed
+        embeddings = patch('readpaper.rag.embed', fake_embed)
+        embeddings.start()
+        self.addCleanup(embeddings.stop)
+
     def test_single_user_login_required_outside_development(self):
         with tempfile.TemporaryDirectory() as directory:
             config = Settings(
@@ -423,7 +429,11 @@ class ReadpaperFlowTests(unittest.TestCase):
         self.assertEqual(sources[3]["title"], "Modern language model methods")
         self.assertEqual(sources[3]["content_scope"], "abstract")
         self.assertEqual(sources[3]["openalex_id"], "https://openalex.org/W5")
-        self.assertIn(sources[3], build_chunks([], sources, "Uploaded paper"))
+        recent_chunks = [chunk for chunk in build_chunks([], sources, "Uploaded paper")
+                         if chunk['document_id'] == sources[3]['id']]
+        self.assertEqual(recent_chunks[0]['text'], sources[3]['text'])
+        self.assertEqual(recent_chunks[0]['content_scope'], 'abstract')
+        self.assertIsNone(recent_chunks[0]['page'])
         self.assertFalse(warnings)
         self.assertFalse(any(item["kind"] != "background" for item in unrelated))
         self.assertTrue(unrelated_warnings)
