@@ -94,6 +94,7 @@ OpenAlex 검색, 공개 PDF 수집, 실제 임베딩, 한국어 검색까지 수
 검증 생성물은 `data/inspection/rag-live-check/`, 화면 캡처는 `data/inspection/ui-check/`에 있으며 Git에는 포함하지 않습니다.
 
 브라우저 검사를 재실행하려면 개발 환경에서 Playwright를 설치하고 프론트엔드를 빌드합니다. 아래 검사는 임시 데이터베이스와 임의의 로컬 포트에 테스트 서버를 띄우고 종료하므로 실제 서비스 데이터나 모델을 사용하지 않습니다.
+Playwright 브라우저가 없으면 시스템의 `chromium` 또는 `chromium-browser`를 사용합니다. 다른 실행 파일을 쓰려면 `READPAPER_CHROMIUM_PATH`를 지정합니다.
 
 ```bash
 ./.venv/bin/pip install playwright

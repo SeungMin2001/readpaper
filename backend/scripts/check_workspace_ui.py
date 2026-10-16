@@ -1,5 +1,5 @@
 """Browser checks against an isolated fixture server; never calls the real answer LLM."""
-import asyncio,json,os,sys,socket,subprocess,tempfile
+import asyncio,json,os,shutil,sys,socket,subprocess,tempfile
 import httpx
 from pathlib import Path
 import pymupdf
@@ -30,7 +30,11 @@ page.insert_text((50,730),'1',fontsize=10)
 file=root/'sample.pdf';doc.save(file);doc.close()
 async def main(base_url):
  async with async_playwright() as p:
-    browser=await p.chromium.launch(headless=True,args=['--no-sandbox'])
+    browser_path = os.getenv('READPAPER_CHROMIUM_PATH')
+    if not browser_path and not Path(p.chromium.executable_path).exists():
+        browser_path = shutil.which('chromium') or shutil.which('chromium-browser')
+    browser=await p.chromium.launch(headless=True,args=['--no-sandbox'],
+                                    executable_path=browser_path)
     tab=await browser.new_page(viewport={'width':1512,'height':982},device_scale_factor=1)
     errors=[];tab.on('pageerror',lambda e:errors.append(str(e)))
     await tab.goto(base_url)
