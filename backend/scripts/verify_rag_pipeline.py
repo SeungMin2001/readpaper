@@ -24,7 +24,10 @@ async def run(args):
     if args.reuse:
         results = json.loads((folder / 'sources' / 'manifest.json').read_text())
     else:
-        sources, warnings = await collect_external_sources(title, root.get('doi') if root else args.doi, [])
+        sources, warnings = await collect_external_sources(
+            title, root.get('doi') if root else args.doi, [],
+            reference_text=root['full_text'] if root else '',
+        )
         selected, related = [], 0
         for source in sources:
             if source['kind'] == 'related':

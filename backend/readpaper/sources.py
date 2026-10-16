@@ -11,6 +11,7 @@ from .config import settings
 
 
 ActivityReporter = Callable[[str, str], Awaitable[None]]
+SOURCE_DISCOVERY_VERSION = 2
 
 
 async def _report_activity(
@@ -42,6 +43,38 @@ def _openalex_params(params: dict[str, Any]) -> dict[str, Any]:
     if settings.openalex_api_key:
         return params | {"api_key": settings.openalex_api_key}
     return params
+
+
+def pdf_reference_dois(text: str) -> tuple[int, list[str]]:
+    """Read numbered PDF bibliography entries without treating body citations as references."""
+    heading = re.search(r"(?im)^[ \t]*(?:references|bibliography)[ \t]*$", text)
+    if not heading:
+        return 0, []
+    section = text[heading.end():]
+    markers = list(re.finditer(r"(?m)^\[(\d{1,4})\]\s*", section))
+    if not markers or int(markers[0].group(1)) != 1:
+        return 0, []
+    identifiers: list[str] = []
+    seen: set[str] = set()
+    count = 0
+    for index, marker in enumerate(markers):
+        if int(marker.group(1)) != count + 1:
+            break
+        count += 1
+        end = markers[index + 1].start() if index + 1 < len(markers) else len(section)
+        entry = section[marker.end():end][:800]
+        arxiv = re.search(r"(?i)(?:\barxiv\s*:\s*|arxiv\.org/abs/)(\d{4}\.\d{4,5})\b", entry)
+        doi = re.search(r"(?i)\b10\.\d{4,9}/[^\s]+", entry)
+        if arxiv:
+            value = f"10.48550/arxiv.{arxiv.group(1)}"
+        elif doi:
+            value = doi.group(0).rstrip('.,;)]}')
+        else:
+            continue
+        if value and value.lower() not in seen:
+            seen.add(value.lower())
+            identifiers.append(value)
+    return count, identifiers
 
 
 def _paper_source(work: dict[str, Any], kind: str, index: int) -> dict[str, Any] | None:
@@ -119,6 +152,7 @@ async def collect_external_sources(
     doi: str | None,
     keywords: list[str],
     on_event: ActivityReporter | None = None,
+    reference_text: str = "",
 ) -> tuple[list[dict[str, Any]], list[str]]:
     sources: list[dict[str, Any]] = []
     warnings: list[str] = []
@@ -187,7 +221,7 @@ async def collect_external_sources(
             related_total = sum(kind == "related" for kind in relation_kinds.values())
             await _report_activity(
                 on_event,
-                f"참고문헌 {reference_total}개와 관련 연구 후보 {related_total}개를 확인했습니다",
+                f"OpenAlex 관계: 참고문헌 {reference_total}개 · 관련 연구 후보 {related_total}개",
                 "success",
             )
 
@@ -221,6 +255,59 @@ async def collect_external_sources(
                     warnings.append("인용·관련 논문 일부의 서지 정보를 가져오지 못했습니다.")
                     await _report_activity(on_event, warnings[-1], "warning")
                     break
+
+            if not reference_total and reference_text:
+                bibliography_count, reference_dois = pdf_reference_dois(reference_text)
+                if bibliography_count:
+                    await _report_activity(
+                        on_event,
+                        f"PDF 참고문헌 {bibliography_count}개에서 DOI·arXiv 식별자 {len(reference_dois)}개 확인",
+                        "success",
+                    )
+                for offset in range(0, len(reference_dois), 25):
+                    batch = reference_dois[offset:offset + 25]
+                    try:
+                        response = await client.get(f"{settings.openalex_url}/works", params=_openalex_params({
+                            "filter": "doi:" + "|".join(f"https://doi.org/{value}" for value in batch),
+                            "per-page": len(batch),
+                        }))
+                        response.raise_for_status()
+                        expected = {value.lower() for value in batch}
+                        for item in response.json().get("results", []):
+                            item_doi = str(item.get("doi") or "").removeprefix("https://doi.org/").lower()
+                            if item_doi in expected:
+                                add_work(item, "referenced")
+                    except (httpx.HTTPError, ValueError, KeyError, TypeError):
+                        warnings.append("PDF 참고문헌 일부의 서지 정보를 가져오지 못했습니다.")
+                        await _report_activity(on_event, warnings[-1], "warning")
+                if bibliography_count:
+                    matched = sum(source["kind"] == "referenced" for source in sources)
+                    await _report_activity(
+                        on_event, f"PDF 참고문헌 중 {matched}/{bibliography_count}편 서지 확인", "success",
+                    )
+
+            if not related_total:
+                terms = [item.get("display_name", "") for item in work.get("keywords") or []
+                         if isinstance(item, dict) and item.get("display_name")]
+                for offset in (0, 2):
+                    query = " ".join(terms[offset:offset + 2]).strip()
+                    if not query or sum(source["kind"] == "related" for source in sources) >= 8:
+                        break
+                    try:
+                        response = await client.get(f"{settings.openalex_url}/works", params=_openalex_params({
+                            "search": query, "per-page": 12,
+                        }))
+                        response.raise_for_status()
+                        for item in response.json().get("results", []):
+                            if sum(source["kind"] == "related" for source in sources) >= 8:
+                                break
+                            add_work(item, "related")
+                    except (httpx.HTTPError, ValueError, KeyError, TypeError):
+                        warnings.append("키워드 기반 관련 연구 검색에 실패했습니다.")
+                        await _report_activity(on_event, warnings[-1], "warning")
+                related = sum(source["kind"] == "related" for source in sources)
+                if related:
+                    await _report_activity(on_event, f"키워드 검색으로 관련 연구 {related}편 확인", "success")
 
             await _report_activity(on_event, "업로드 논문을 인용한 연구를 검색하는 중")
             try:

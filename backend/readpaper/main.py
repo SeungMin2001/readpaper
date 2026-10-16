@@ -23,7 +23,7 @@ from .llm import InvalidModelOutput, ModelUnavailable, VLLMClient, close_model_t
 from .pdf import extract_pdf
 from .rag import INDEX_VERSION, build_chunks, build_index, retrieve
 from .fulltext import collect_fulltext
-from .sources import collect_external_sources
+from .sources import SOURCE_DISCOVERY_VERSION, collect_external_sources
 from .terms import gloss_cache_key, resolve_term
 
 
@@ -210,6 +210,7 @@ async def process_paper(paper_id: str) -> None:
         # Paper reading and local RAG preparation must not depend on an LLM call.
         external, warnings = await collect_external_sources(
             payload["title"], payload.get("doi"), [], on_event=report_collection_event,
+            reference_text=payload.get("full_text", ""),
         )
         # OpenAlex returns related_works ordered by its own relevance signal.
         # Use the first eight as an explicit, non-LLM baseline for this stage.
@@ -251,7 +252,9 @@ async def process_paper(paper_id: str) -> None:
             db.set_paper(paper_id, progress=75 + int(24 * done / total))
         index = await asyncio.to_thread(build_index, chunks, directory / 'index', report_index_progress)
         index['fulltext_documents'] = sum(source.get('fulltext_status') == 'ready' for source in external)
-        db.merge_paper_data(paper_id, {'rag_index': index})
+        db.merge_paper_data(paper_id, {
+            'rag_index': index, 'source_discovery_version': SOURCE_DISCOVERY_VERSION,
+        })
         db.add_paper_activity(paper_id, f"검색 색인 저장: {len(chunks)}개 청크 · {index['dimensions']}차원", 'success')
         db.set_paper(paper_id, status="ready", progress=100, error="")
         db.add_paper_activity(paper_id, "원문·문헌·검색 문맥 준비 완료.", "success")
@@ -352,11 +355,16 @@ async def upload_paper(background: BackgroundTasks, file: UploadFile = File(...)
         directory = settings.data_dir / 'papers' / cached['id']
         directory.mkdir(parents=True, exist_ok=True)
         (directory / 'original.pdf').write_bytes(data)
-        if cached['data'].get('rag_index', {}).get('version') != INDEX_VERSION or cached['data'].get('rag_index', {}).get('model') != settings.embedding_model or not (directory / 'index' / 'vectors.npy').is_file():
+        old_empty_sources = (not cached['data'].get('external_sources') and
+                             cached['data'].get('source_discovery_version') != SOURCE_DISCOVERY_VERSION)
+        needs_index = (cached['data'].get('rag_index', {}).get('version') != INDEX_VERSION or
+                       cached['data'].get('rag_index', {}).get('model') != settings.embedding_model or
+                       not (directory / 'index' / 'vectors.npy').is_file())
+        if old_empty_sources or needs_index:
             db.set_paper(cached['id'], status='processing', progress=0)
             background.add_task(process_paper, cached['id'])
         _start_gloss_preparation(cached["id"], cached["data"], background)
-        return {"paper_id": cached["id"], "status": "ready", "cached": True}
+        return {"paper_id": cached["id"], "status": "processing" if old_empty_sources or needs_index else "ready", "cached": True}
     try:
         parsed = extract_pdf(data)
     except ValueError as exc:

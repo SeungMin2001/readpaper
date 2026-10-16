@@ -1,5 +1,6 @@
 import os
 import asyncio
+import json
 import sys
 import tempfile
 import unittest
@@ -20,7 +21,7 @@ from readpaper.llm import ModelUnavailable  # noqa: E402
 from readpaper.main import app  # noqa: E402
 from readpaper.pdf import extract_pdf  # noqa: E402
 from readpaper.rag import build_chunks, retrieve  # noqa: E402
-from readpaper.sources import collect_external_sources, reconstruct_abstract  # noqa: E402
+from readpaper.sources import collect_external_sources, pdf_reference_dois, reconstruct_abstract  # noqa: E402
 from fetch_open_access_fulltext import _extract_pdf_text, _title_match_score  # noqa: E402
 
 
@@ -76,7 +77,7 @@ class FakeVLLM:
         return {"answer": "근거에 따르면 로봇 제어를 개선합니다.", "citations": [contexts[0]["id"]]}
 
 
-async def fake_sources(title, doi, keywords, on_event=None):
+async def fake_sources(title, doi, keywords, on_event=None, reference_text=""):
     if on_event:
         await on_event("OpenAlex에서 관련 연구 후보를 확인했습니다", "success")
     return [{
@@ -303,6 +304,35 @@ class ReadpaperFlowTests(unittest.TestCase):
                     )
                     self.assertEqual(client.get(f"/api/papers/{paper_id}").json()["status"], "ready")
 
+    def test_reupload_refreshes_old_empty_source_results(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Settings(data_dir=Path(directory), dev_mode=True)
+            pdf_bytes = example_pdf()
+            with patch("readpaper.db.settings", config), patch("readpaper.main.settings", config), \
+                    patch("readpaper.main.VLLMClient", return_value=FakeVLLM()), \
+                    patch("readpaper.main.collect_external_sources", fake_sources):
+                with TestClient(app) as client:
+                    first = client.post("/api/papers/upload", files={
+                        "file": ("sample.pdf", pdf_bytes, "application/pdf"),
+                    }).json()
+                    paper_id = first["paper_id"]
+                    with db.connect() as connection:
+                        data = json.loads(connection.execute(
+                            "SELECT data_json FROM papers WHERE id = ?", (paper_id,),
+                        ).fetchone()[0])
+                        data["external_sources"] = []
+                        data.pop("source_discovery_version", None)
+                        connection.execute("UPDATE papers SET data_json = ? WHERE id = ?",
+                                           (json.dumps(data), paper_id))
+                    refreshed = client.post("/api/papers/upload", files={
+                        "file": ("sample.pdf", pdf_bytes, "application/pdf"),
+                    }).json()
+                    self.assertTrue(refreshed["cached"])
+                    self.assertEqual(refreshed["status"], "processing")
+                    paper = client.get(f"/api/papers/{paper_id}").json()
+                    self.assertEqual(paper["status"], "ready")
+                    self.assertEqual(len(paper["sources"]), 1)
+
     def test_retrieval_and_abstract_reconstruction(self):
         self.assertEqual(
             reconstruct_abstract({"learning": [1], "Machine": [0], "works.": [2]}),
@@ -375,6 +405,58 @@ class ReadpaperFlowTests(unittest.TestCase):
         self.assertFalse(warnings)
         self.assertTrue(any("참고문헌 9개" in message for message, _state in activity))
         self.assertTrue(any("서지정보 9/9개 처리 완료" in message for message, _state in activity))
+
+    def test_empty_openalex_relations_use_verified_pdf_identifiers_and_keywords(self):
+        bibliography = ("Introduction\nReferences\n"
+                        "[1] A study. arXiv: 1409.0473 [cs.CL].\n"
+                        "[2] Another study. DOI: 10.1145/3620665.3640366.\n"
+                        "[3] A web page without a scholarly identifier.\n")
+        self.assertEqual(pdf_reference_dois(bibliography), (
+            3, ["10.48550/arxiv.1409.0473", "10.1145/3620665.3640366"],
+        ))
+
+        def work(work_id, title, doi=None):
+            return {"id": f"https://openalex.org/{work_id}", "display_name": title,
+                    "doi": doi, "abstract_inverted_index": {}, "authorships": []}
+
+        def respond(request):
+            params = request.url.params
+            relation_filter = params.get("filter", "")
+            if relation_filter.startswith("doi:"):
+                return httpx.Response(200, json={"results": [
+                    work("W2", "A study", "https://doi.org/10.48550/arxiv.1409.0473"),
+                    work("W3", "Another study", "https://doi.org/10.1145/3620665.3640366"),
+                ]})
+            if relation_filter.startswith("cites:"):
+                return httpx.Response(200, json={"results": []})
+            if params.get("search") == "A New Model":
+                return httpx.Response(200, json={"results": [{
+                    **work("W1", "A New Model"), "referenced_works": [], "related_works": [],
+                    "keywords": [{"display_name": "mixture of experts"},
+                                 {"display_name": "reasoning models"}],
+                }]})
+            if "search" in params:
+                return httpx.Response(200, json={"results": [
+                    work("W1", "A New Model"), work("W4", "Related research"),
+                ]})
+            return httpx.Response(200, json={"results": []})
+
+        activity = []
+        async def collect_event(message, state):
+            activity.append(message)
+
+        client_class = httpx.AsyncClient
+        with patch("readpaper.sources.httpx.AsyncClient", side_effect=lambda **kwargs: client_class(
+            transport=httpx.MockTransport(respond), **kwargs,
+        )):
+            sources, warnings = asyncio.run(collect_external_sources(
+                "A New Model", None, [], on_event=collect_event, reference_text=bibliography,
+            ))
+        self.assertEqual([source["kind"] for source in sources], ["referenced", "referenced", "related"])
+        self.assertEqual([source["title"] for source in sources], ["A study", "Another study", "Related research"])
+        self.assertTrue(any("PDF 참고문헌 중 2/3편" in message for message in activity))
+        self.assertTrue(any("키워드 검색으로 관련 연구 1편" in message for message in activity))
+        self.assertFalse(warnings)
 
     def test_external_sources_are_labeled_and_title_matched(self):
         def work(work_id, title):
