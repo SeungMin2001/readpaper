@@ -6,7 +6,7 @@ Keep collection, extraction, and retrieval artifacts inside this directory. Gene
 - `papers/collected/`: retrieved open-access PDFs and extracted text.
 - `chunks/`: chunk inspection exports.
 - `inspection/`: GROBID XML, collection manifests, and retrieval diagnostics.
-- `runtime/`: local SQLite database for analyzed papers and vocabulary.
+- `runtime/`: local SQLite database, analyzed papers, extracted text, chunk metadata, and model caches. Qdrant keeps the actual vectors in its separate Docker volume.
 
 ## Run citation collection for any PDF
 
@@ -47,8 +47,8 @@ PY
 
 ## Related-paper discovery
 
-The web analysis flow checks the uploaded paper's title before accepting an OpenAlex DOI match, then gathers referenced and related candidates. The configured vLLM model ranks up to eight related or recent candidates using the uploaded-paper summary and candidate abstracts. The PDF collection script above reads printed citations independently. In the current web flow, those related-paper records still contain abstracts; downloading their full text and adding it to RAG is a separate integration step. A paper that has no public full-text copy cannot be collected in full automatically.
+The web analysis flow checks the uploaded paper's title before accepting an OpenAlex DOI match, then gathers referenced and related candidates. It selects up to eight related candidates in OpenAlex order, downloads verified public PDFs when available, and indexes their full text alongside the uploaded paper. Records without a public PDF are marked as abstract-only evidence. The GROBID script above reads printed citations independently.
 
 As a generic collection check, GROBID processed the unrelated arXiv paper “BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding” and extracted its title, arXiv ID, and 55 printed references without using the Attention-specific override list. The generic OpenAlex/Crossref/arXiv path resolved 30 references and saved 9 full texts in this run; the rest were marked as metadata failures, no listed public PDF, or download failure. This environment had exhausted its shared OpenAlex quota and had no Unpaywall email configured, so this run is a parser/fallback check rather than a completeness benchmark. Its manifest and XML are in `inspection/bert-pretraining-2018-citations*`.
 
-The upload flow currently extracts the uploaded PDF in memory and stores translations, abstracts, and chunks in SQLite under `runtime/`; it does not persist the original upload. Docker can override that runtime location with `READPAPER_DATA_DIR=/data`.
+The upload flow saves the original PDF temporarily under `runtime/papers/<paper_id>/` and stores translations, abstracts, and chunk metadata in SQLite. The actual dense and BM25 vectors are stored in the Qdrant Docker volume. Paper files and collections expire after 24 hours of inactivity; vocabulary remains. Docker sets `READPAPER_DATA_DIR=/data`.

@@ -10,10 +10,10 @@
 | PDF 본문·좌표 추출 | PyMuPDF, 원문 페이지·문장 ID 유지 | 웹 백엔드 |
 | 문헌 식별·관계 수집 | OpenAlex DOI/제목 조회, 빈 관계 목록은 PDF DOI·arXiv ID와 키워드 검색으로 보완, 관련 최대 8편·피인용 최대 5편 | 웹 백엔드 |
 | 전문 확보 | 공개 PDF 다운로드, 크기·페이지·제목 검사, 실패 시 초록/서지 구분 | 웹 백엔드 |
-| 청킹 | 페이지 경계, 최대 110개 단어, 문장 겹침 | 웹 백엔드 |
-| 의미 벡터 | FastEmbed + multilingual MiniLM, 384차원, 토큰 초과 구간도 임베딩 후 평균 | 웹 서버 CPU |
-| 저장 | PDF/TXT/JSON/NumPy, 상태·로그는 SQLite | Docker 데이터 볼륨 |
-| 검색 | 의미 점수 0.8 + TF-IDF 점수 0.2, 겹치는 문장 제외 | 웹 서버 CPU |
+| 청킹 | LangChain 텍스트 분할기, 페이지·절 경계, E5 기준 400토큰·55토큰 겹침 | 웹 백엔드 |
+| 의미 벡터 | multilingual-e5-small, 정규화된 384차원, API 배치 처리 | Mac mini MPS GPU |
+| 저장 | PDF/TXT/JSON과 상태·로그는 SQLite, dense·BM25 벡터는 Qdrant | Docker 영구 볼륨 |
+| 검색 | LangChain QdrantVectorStore의 RRF 하이브리드 검색, 겹치는 문장 제외 | Qdrant + 웹 백엔드 |
 | 질문 정규화·답변 | Gemma 4 12B, OpenAI 호환 vLLM API | Mac mini |
 | 선택한 그림 | 서버가 원본 PDF를 크롭해 image_url로 전송 | 웹 백엔드 → Mac mini |
 | 출처 | 실제 제공된 청크 ID 검증, 문서·페이지·문장·원문과 PDF 링크 | 백엔드 + 브라우저 |
@@ -25,16 +25,15 @@
 1. `backend/readpaper/main.py`: 업로드, 진행 기록, 준비 작업, 질문 API의 연결.
 2. `backend/readpaper/sources.py`: 업로드 논문 식별, OpenAlex 관계 후보 조회.
 3. `backend/readpaper/fulltext.py`: 공개 PDF 다운로드·제목 검사·본문과 파일 저장.
-4. `backend/readpaper/rag.py`: 청킹, 임베딩, 색인 저장, 검색과 중복 제거.
-5. `backend/readpaper/llm.py`: 질문 검색어, 선택한 이미지, 근거 기반 답변과 인용 ID 검사.
-6. `frontend/src/PdfReader.tsx`: 원문 위 좌표, 번역 영역, 문장/그림 선택.
-7. `frontend/src/App.tsx`: 준비 화면, 채팅 첨부·대화 이력·출처, 문헌 목록.
+4. `backend/readpaper/rag.py`: 청킹, 원격 E5 임베딩, Qdrant 색인·검색과 중복 제거.
+5. `embedding_service/server.py`: Mac mini MPS 임베딩 API.
+6. `backend/readpaper/llm.py`: 질문 검색어, 선택한 이미지, 근거 기반 답변과 인용 ID 검사.
+7. `frontend/src/PdfReader.tsx`: 원문 위 좌표, 번역 영역, 문장/그림 선택.
+8. `frontend/src/App.tsx`: 준비 화면, 채팅 첨부·대화 이력·출처, 문헌 목록.
 
 ## 아직 적용하지 않은 확장
 
-- **LangChain:** 현재 단계별 함수로 경계를 분리했다. Document·검색기·분할기의 인터페이스가 필요해질 때 도입하고 기존 테스트를 유지한다.
-- **Qdrant와 BM25:** 개인용 규모는 파일 벡터와 TF-IDF를 사용한다. 여러 사용자·지속 색인·필터 검색 요구가 생기면 Qdrant와 BM25로 비교한다.
-- **Cross-encoder 리랭커:** 현재의 점수 결합·중복 제거는 별도의 학습된 리랭커가 아니다. 정답 근거 목록을 만들어 Recall@5/10과 지연을 먼저 측정하고 리랭커의 추가 이득을 평가한다.
+- **Cross-encoder 리랭커:** 현재의 RRF 결합·중복 제거는 별도의 학습된 리랭커가 아니다. 정답 근거 목록을 만들어 Recall@5/10과 지연을 먼저 측정하고 리랭커의 추가 이득을 평가한다.
 - **LLM 관련 논문 선정:** 현재는 OpenAlex 관련 후보 순서를 사용한다. 기존 `select_related_papers`를 채택하려면 주제 관련성·최신성 정답 사례로 비교한다.
 - **구조 파서 확대:** PyMuPDF 기준선은 모든 PDF의 다단 편집·표·수식·각주를 정확히 이해하지 못한다. GROBID/Docling, 절·표·캡션 분리를 별도 평가한다. 현재 PDF 참고문헌 보완은 번호 목록의 DOI·arXiv ID만 확인하므로 식별자가 없는 서지를 검증해 연결하는 작업도 후속 과제다.
 - **작업 큐:** 현재 FastAPI 백그라운드 작업이며 중단 시 실패와 재시도를 제공한다. 다중 사용자/다중 워커 운영에서는 Redis+작업자 큐, 동시 수집 제한, 원자적 작업 선점을 추가한다.

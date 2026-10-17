@@ -78,7 +78,7 @@ def extract_pdf(data: bytes) -> dict[str, Any]:
             page_words.append(word)
             blocks.setdefault(block_no, []).append(word)
 
-        for block_words in _reading_order(blocks, page.rect.width):
+        for block_index, block_words in enumerate(_reading_order(blocks, page.rect.width)):
             pending: list[dict[str, Any]] = []
 
             def flush() -> None:
@@ -91,6 +91,7 @@ def extract_pdf(data: bytes) -> dict[str, Any]:
                 sentences.append({
                     "id": sentence_id, "page": page_index,
                     "text": text, "word_ids": [word["id"] for word in pending],
+                    "block": block_index,
                 })
                 all_text.append(text)
                 pending.clear()

@@ -56,7 +56,7 @@
 
 ## 이번 구현 상태
 
-PDF 선택·그림 첨부·채팅 출처·웹 전문 수집·CPU 임베딩·의미/키워드 검색 연결을 구현했다. 실제 검증과 남은 제한은 [채팅·RAG 검증](workspace-rag.md)에 기록한다. LangChain, Qdrant, 별도 리랭커, 작업 큐는 후속 단계다.
+PDF 선택·그림 첨부·채팅 출처·웹 전문 수집·LangChain 청킹·Mac mini E5 임베딩 API·Qdrant 하이브리드 검색 연결을 구현했다. 실제 검증과 남은 제한은 [채팅·RAG 검증](workspace-rag.md)에 기록한다. Mac mini 실측, 별도 리랭커와 작업 큐는 후속 단계다.
 
 ## 후속 평가
 

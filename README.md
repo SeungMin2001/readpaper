@@ -10,11 +10,11 @@
 - 같은 논문의 동일한 요약·모델·용어는 다른 페이지에서도 저장된 뜻을 재사용합니다. 동일 입력의 동시 요청은 추론을 한 번만 실행하고 각 위치에 결과를 연결합니다. 서로 다른 용어 요청은 병렬로 보냅니다.
 - 번역 요청은 Thinking을 명시적으로 끄고 HTTP 연결을 재사용합니다. 고정 지시문과 논문 요약을 공통 접두부로 배치해 서버가 지원하는 prefix caching을 활용할 수 있습니다. 실제 캐시 적중 여부는 모델 서버 측정값으로 확인해야 합니다.
 - OpenAlex에서 참고문헌과 관련 최대 8편·피인용 최대 5편을 찾습니다. OpenAlex 관계가 비어 있으면 PDF 참고문헌의 DOI·arXiv ID로 서지를 확인하고 논문 키워드로 관련 후보를 검색합니다. 공개 PDF는 제목을 대조한 뒤 본문을 수집하며, 전문 미확보 자료는 초록/서지 정보로 구분합니다.
-- 본문을 페이지·문장별로 청킹하고 CPU 다국어 MiniLM 임베딩(384차원)을 저장합니다. 의미 검색과 TF-IDF를 결합해 채팅 근거를 찾고 문서·페이지·문장 ID·원문을 출처로 표시합니다.
+- 본문을 페이지·절·문장 기준으로 청킹합니다. Mac mini의 MPS GPU에서 multilingual-e5-small 임베딩(384차원)을 배치 생성하고, Docker Qdrant에서 dense 벡터와 BM25를 결합해 채팅 근거를 찾습니다. 문서·페이지·문장 ID·원문을 출처로 표시합니다.
 - 문장과 그림 영역을 선택해 오른쪽 채팅에 첨부할 수 있습니다. 그림은 원본 PDF에서 잘라 모델의 이미지 입력으로 보냅니다. 채팅은 최근 대화와 Markdown 답변을 지원합니다.
-- 단어장은 SQLite에 저장합니다. PDF 원본·수집 PDF·추출 텍스트·벡터는 마지막 사용 후 24시간이 지나면 함께 삭제합니다.
+- 단어장은 SQLite에 저장합니다. PDF 원본·수집 PDF·추출 텍스트·Qdrant 색인은 마지막 사용 후 24시간이 지나면 함께 삭제합니다.
 
-화면 사용법, 데이터 저장 위치, 실제 수집 결과는 [채팅·RAG 사용 및 검증](docs/workspace-rag.md)을 참고하세요. 최초 문헌 준비 시 웹 서버에서 임베딩 모델을 다운로드합니다. 그림 질문에는 vLLM의 이미지 입력 지원이 필요합니다.
+화면 사용법, 데이터 저장 위치, 실제 수집 결과는 [채팅·RAG 사용 및 검증](docs/workspace-rag.md)을 참고하세요. 최초 실행 시 Mac mini가 E5 모델을, 웹 서버가 토크나이저와 BM25 모델을 다운로드합니다. 그림 질문에는 vLLM의 이미지 입력 지원이 필요합니다.
 
 ## Mac mini에서 vLLM-Metal 실행
 
@@ -40,9 +40,13 @@ curl http://localhost:8001/v1/models \
 
 기존 Ollama 체크포인트 정보를 확인하려면 `ollama show --modelfile gemma4:12b`를 실행합니다. vLLM 연결과 뜻 품질을 확인한 뒤 기존 Gemma 파일을 지우려면 `ollama rm gemma4:12b`를 실행합니다. `ollama list`에 있는 다른 모델도 지우려면 각 모델 이름을 확인해 별도로 `ollama rm <모델명>`을 실행합니다.
 
+## Mac mini에서 임베딩 서버 실행
+
+Apple Silicon Mac에서 [임베딩 서버 안내](embedding_service/README.md)에 따라 별도 터미널에 E5 서버를 실행합니다. vLLM과 동시에 실행할 때는 Mac의 사용 가능한 메모리와 MPS 사용량을 확인합니다.
+
 ## 웹 앱 실행
 
-Python 3.12와 Node.js 24가 필요합니다. vLLM-Metal을 위 명령으로 실행한 상태에서:
+Python 3.12와 Node.js 24가 필요합니다. vLLM-Metal, 임베딩 서버, Qdrant를 실행한 상태에서 웹 백엔드를 시작합니다. 로컬 Qdrant는 `.env.example`을 `.env`로 복사한 뒤 `docker compose up -d qdrant`로 실행할 수 있습니다.
 
 ```bash
 cd backend
@@ -53,6 +57,9 @@ READPAPER_DEV_MODE=1 \
 READPAPER_LLM_BASE_URL=http://127.0.0.1:8001/v1 \
 READPAPER_LLM_MODEL=gemma4-12b \
 READPAPER_LLM_API_KEY="$VLLM_API_KEY" \
+READPAPER_EMBEDDING_BASE_URL=http://127.0.0.1:8002/v1 \
+READPAPER_EMBEDDING_API_KEY="$READPAPER_EMBEDDING_API_KEY" \
+READPAPER_QDRANT_URL=http://127.0.0.1:6333 \
 uvicorn readpaper.main:app --reload
 ```
 
@@ -66,14 +73,14 @@ npm run dev
 
 ## Docker와 클라우드 배포
 
-Docker로 웹 앱을 실행할 때 `.env.example`을 `.env`로 복사합니다. `READPAPER_LLM_BASE_URL`은 Mac에서 실행 중인 vLLM 서버 주소로 둡니다. 기본값 `http://host.docker.internal:8001/v1`은 Docker Desktop에서 Mac 호스트로 연결할 때 사용합니다. `READPAPER_LLM_API_KEY`에는 `vllm serve --api-key`에 전달한 동일한 키를 넣습니다.
+Docker로 웹 앱을 실행할 때 `.env.example`을 `.env`로 복사합니다. `READPAPER_LLM_BASE_URL`과 `READPAPER_EMBEDDING_BASE_URL`을 Mac의 vLLM·임베딩 서버 주소로 둡니다. `host.docker.internal` 기본값은 Mac의 Docker Desktop에서 사용합니다. 두 API 키를 각각의 서버와 일치시키세요. Compose가 Qdrant 컨테이너와 영구 볼륨을 함께 시작합니다.
 
 ```bash
 docker compose up -d --build
 docker compose exec web python -c 'import os,urllib.request; req=urllib.request.Request("http://host.docker.internal:8001/v1/models",headers={"Authorization":"Bearer "+os.getenv("READPAPER_LLM_API_KEY","")}); print(urllib.request.urlopen(req).read().decode())'
 ```
 
-클라우드 앱 서버에서 Mac mini vLLM에 연결할 때는 두 기기를 Tailscale 같은 사설망에 연결하고, `.env`의 주소를 `http://<Mac의 사설 IP>:8001/v1`로 설정합니다. vLLM API 키를 설정하고 포트 8001을 공개 인터넷에 열지 마세요. Mac이 꺼져 있으면 새 뜻 생성과 질문 답변이 멈춥니다. 상시 서비스가 필요하면 AWS GPU 인스턴스에 CUDA용 vLLM을 배포할 수 있지만, GPU를 켜 둔 시간만큼 비용이 발생합니다.
+클라우드 앱 서버에서 Mac mini에 연결할 때는 두 기기를 Tailscale 같은 사설망에 연결하고, `.env`의 주소를 `http://<Mac의 사설 IP>:8001/v1`과 `http://<Mac의 사설 IP>:8002/v1`로 설정합니다. 두 서버의 API 키를 설정하고 포트 8001·8002를 공개 인터넷에 열지 마세요. Mac이 꺼져 있으면 새 뜻 생성·질문 답변·색인 준비가 멈춥니다. 상시 서비스가 필요하면 AWS GPU 인스턴스에 모델 서버를 배포할 수 있지만, GPU를 켜 둔 시간만큼 비용이 발생합니다.
 
 HTTPS 공개 배포 절차는 [배포 안내](docs/deployment.md)를 참고하세요. 데이터 수집 흐름은 [RAG 수집 점검 기록](docs/rag-source-check.md), 제품 범위는 [제품 구상](docs/product-brief.md), 진행 순서는 [로드맵](docs/roadmap.md), 검색 설계는 [RAG 설계](docs/rag-design.md)에 기록합니다.
 

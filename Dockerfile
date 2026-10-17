@@ -15,7 +15,8 @@ WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app/backend \
-    READPAPER_DATA_DIR=/data
+    READPAPER_DATA_DIR=/data \
+    HF_HOME=/data/models/huggingface
 COPY backend/requirements.txt /app/backend/requirements.txt
 RUN --mount=type=secret,id=build_ca,required=false \
     if [ -f /run/secrets/build_ca ]; then \

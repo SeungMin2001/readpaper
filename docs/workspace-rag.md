@@ -18,29 +18,31 @@ flowchart LR
     B --> C[OpenAlex 논문 식별]
     C --> D[참고문헌·관련 8편·피인용 후보]
     D --> E[공개 PDF 다운로드·제목 대조]
-    E --> F[페이지별 문장 청킹]
+    E --> F[페이지·절·문장별 토큰 청킹]
     B --> F
-    F --> G[다국어 MiniLM 임베딩]
-    G --> H[파일에 벡터·출처 저장]
-    I[질문·선택 영역·최근 대화] --> J[영문 검색어 생성]
-    J --> K[의미 검색 + 키워드 검색]
-    H --> K
+    F --> G[Mac mini MPS E5 임베딩]
+    F --> H[웹 서버 BM25 희소 벡터]
+    G --> I[Qdrant dense·BM25 색인]
+    H --> I
+    Q[질문·선택 영역·최근 대화] --> J[영문 검색어 생성]
+    J --> K[Qdrant 하이브리드 검색]
+    I --> K
     K --> L[중복 근거 제외·최대 6개]
     L --> M[Gemma 답변·인용 ID 검증]
-    I --> M
+    Q --> M
 ```
 
 - **수집:** OpenAlex에 등록된 전체 참고문헌 ID를 배치 조회합니다. 이 목록이 비었으면 PDF의 번호 붙은 참고문헌에서 DOI·arXiv ID를 읽어 OpenAlex에서 정확히 일치하는 서지를 찾습니다. 식별자가 없거나 서지가 등록되지 않은 참고문헌은 확보 건수에 넣지 않습니다. 관련 후보는 OpenAlex 순서의 최대 8편이며, 관계 목록이 비면 논문 키워드 검색으로 최대 8편을 보완합니다. 피인용은 OpenAlex의 최대 5편만 사용합니다. 키워드 검색 결과를 실제 인용 관계로 표시하지 않습니다. 기존 GROBID 진단 스크립트와 별개로, 웹 경로는 OpenAlex와 PDF 식별자를 사용합니다.
 - **전문:** 공개 PDF 주소를 최대 3편씩 동시에 내려받습니다. 각 PDF는 HTTPS·공개 주소·최대 25MB·100페이지·텍스트층·제목 일치 검사를 거칩니다. 실패하면 오류를 기록하고 초록만 검색하거나, 초록도 없으면 검색 색인에서 제외합니다. 유료 원문 우회, OCR, 임의의 HTML 본문 수집은 하지 않습니다.
-- **청킹:** 페이지 경계를 넘지 않고 최대 110개 공백 기준 단어를 묶습니다. 긴 문장은 70개 단어 단위로 나눕니다. 여러 문장으로 구성한 청크는 마지막 문장을 다음 청크에 겹칩니다. 원문 페이지와 문장 ID를 보존합니다.
-- **임베딩:** FastEmbed 0.7.4의 `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`, 384차원입니다. 웹 서버의 CPU에서 실행하므로 번역용 Gemma 모델을 바꾸거나 Mac GPU에 다른 모델을 추가하지 않습니다. 128 모델 토큰을 초과한 청크는 토큰 창으로 나눠 모두 임베딩한 뒤 평균·정규화하므로 뒷부분을 잘라 버리지 않습니다. 최초 사용 때만 Hugging Face에서 별도 임베딩 가중치를 다운로드해 캐시합니다.
-- **검색:** 정규화한 벡터의 내적과 TF-IDF 점수를 0.8:0.2로 합칩니다. 문장 ID가 많이 겹치는 결과를 제거합니다. 별도 cross-encoder 리랭커와 LangChain은 아직 사용하지 않습니다. 고정 점수 기준은 관련성에 대한 확률이나 검증된 정확도 지표가 아닙니다.
+- **청킹:** LangChain `RecursiveCharacterTextSplitter`와 E5 토크나이저로 최대 400토큰, 55토큰 겹침을 적용합니다. 페이지와 감지된 절 경계는 넘지 않으며 원문 페이지·문장 ID를 보존합니다. 추출된 문장과 문단 블록을 우선 사용하고 긴 문장은 분할합니다.
+- **임베딩:** Mac mini의 PyTorch MPS에서 `intfloat/multilingual-e5-small`을 실행합니다. 웹 서버는 `passage: ` 또는 `query: ` 접두부를 붙여 64개씩 인증된 API에 요청합니다. 서버는 32개씩 모델에 넣고 정규화된 384차원 벡터를 반환합니다. Mac mini의 첫 실행에는 모델 다운로드가 필요합니다.
+- **검색:** LangChain QdrantVectorStore가 Qdrant의 cosine dense 벡터와 `Qdrant/bm25` 희소 벡터를 저장하고 RRF로 결합합니다. 검색 결과는 저장된 청크 ID와 대조한 뒤 문장 ID가 많이 겹치는 결과를 제외합니다. BM25 모델은 웹 서버 CPU에서 실행합니다. 현재 점수는 관련성 확률이 아닙니다.
 - **LLM 입력:** 최대 6개 근거(선택 영역 포함), 짧게 제한한 최근 대화, 선택한 그림만 전달합니다. 논문 전문 전체를 매 질문마다 모델에 보내지는 않습니다. 이전 답변은 대화 문맥이며 검색 근거로 취급하지 않습니다.
 - **캐시 이관:** 이전 초록 검색 결과를 가진 PDF를 다시 업로드하면 새 색인을 만듭니다. 임베딩 모델 또는 색인 버전이 바뀌어도 다시 구축합니다.
 
 ## 저장 위치
 
-로컬 기본값은 `readpaper/data/runtime/`, Docker는 기존 `readpaper-data` 볼륨의 `/data/`입니다. 이번 변경에서 기존 볼륨을 교체하거나 삭제하지 않습니다.
+로컬 기본값은 `readpaper/data/runtime/`, Docker는 `readpaper-data` 볼륨의 `/data/`입니다. 벡터 본체는 별도 `qdrant-data` 볼륨의 Qdrant 컬렉션에 저장됩니다. 이전 `vectors.npy` 파일은 새 색인을 만들 때 삭제합니다.
 
 ```text
 papers/<paper_id>/
@@ -51,13 +53,13 @@ papers/<paper_id>/
     manifest.json          서지·문장·성공/실패 상태
   index/
     chunks.json            청크·페이지·문장 ID
-    vectors.npy            수치 벡터 (pickle 사용 안 함)
-    index.json             모델·차원·청크 수·버전
-models/                    임베딩 모델 캐시
+    index.json             Qdrant 컬렉션·모델·차원·청크 수·시간
+models/                    E5 토크나이저·BM25 모델 캐시
 readpaper.sqlite3          논문 상태·진행 기록·단어장
+qdrant-data 볼륨/          논문별 dense·BM25 벡터 컬렉션
 ```
 
-논문은 마지막 사용 후 24시간이 지나면 DB, PDF, 본문, 색인을 함께 삭제합니다. 단어장과 공용 임베딩 모델 캐시는 유지합니다. Docker 데이터를 로컬 폴더에서 확인하려면:
+논문은 마지막 사용 후 24시간이 지나면 DB, PDF, 본문을 삭제하며 Qdrant 컬렉션도 정리합니다. 단어장과 공용 모델 캐시는 유지합니다. Docker 데이터를 로컬 폴더에서 확인하려면:
 
 ```bash
 docker compose cp web:/data/papers ./data/inspection/web-papers
@@ -68,11 +70,11 @@ docker compose cp web:/data/papers ./data/inspection/web-papers
 ## 검증
 
 ```bash
-PYTHONPATH=backend ./.venv/bin/python -m unittest discover -s backend/tests -v
+PYTHONPATH=backend:backend/tests ./.venv/bin/python -m unittest discover -s backend/tests -v
 npm run build --prefix frontend
 ```
 
-로컬과 Docker에서 47개 테스트가 통과했습니다. 자동 테스트는 네트워크·Gemma 없이 실행하며 임베딩과 답변은 결정적 테스트 대역을 사용합니다. 수집·검색의 실제 네트워크/모델 검사는 다음처럼 별도로 실행합니다.
+이번 변경에서 자동 테스트 50개가 통과했습니다. 테스트는 Gemma와 Mac GPU 없이 Qdrant 로컬 인스턴스·결정적 임베딩 대역을 사용합니다. 실제 Qdrant Docker 컨테이너에서도 색인과 하이브리드 검색을 확인했습니다. 수집·검색의 실제 네트워크/모델 검사는 다음처럼 별도로 실행합니다.
 
 ```bash
 ./.venv/bin/python backend/scripts/verify_rag_pipeline.py \
@@ -80,16 +82,16 @@ npm run build --prefix frontend
   --out data/inspection/rag-check
 ```
 
-OpenAlex 검색, 공개 PDF 수집, 실제 임베딩, 한국어 검색까지 수행하고 `report.json`에 기록합니다. `--pdf data/papers/input/example.pdf`로 업로드 논문도 포함할 수 있습니다. `--reuse`는 이미 저장된 manifest에서 색인만 다시 만듭니다. 이 검사는 답변용 Gemma를 호출하지 않습니다.
+OpenAlex 검색, 공개 PDF 수집, Mac mini E5 임베딩, Qdrant 한국어 검색까지 수행하고 `report.json`에 기록합니다. Mac 임베딩 서버와 Qdrant를 먼저 실행하고 환경 변수로 주소·API 키를 지정해야 합니다. `--pdf data/papers/input/example.pdf`로 업로드 논문도 포함할 수 있습니다. `--reuse`는 이미 저장된 manifest에서 색인만 다시 만듭니다. 이 검사는 답변용 Gemma를 호출하지 않습니다.
 
-### 이번 검증 결과
+### 이전 MiniLM 기준선 검증 결과
 
 - 실서비스 API에서 메타데이터 36편 발견 → 관련 후보 8편 제한 후 33편 처리(참고 21, 관련 8, 피인용 4).
 - 전문 확보 18편, 공개 PDF 주소 없음 9편, 다운로드·제목 검증 등 실패 6편. 일부의 실패를 전체 전문 확보 성공으로 취급하지 않았습니다.
-- 외부 자료에서 2,094개 청크, 384차원 색인 생성. 실제 한국어 질문으로 영문 근거 검색 실행.
+- 외부 자료에서 2,094개 청크, 384차원 파일 색인 생성. 당시 MiniLM·TF-IDF로 한국어 질문을 검색한 결과이며 새 E5·Qdrant 품질 수치가 아닙니다.
 - 독립된 세 문서 검색 사례에서 한국어 쿼리·키 질문과 강화학습 보상 질문이 각각 해당 영문 문서를 1위로 검색했습니다. 이 두 사례가 일반적인 검색 정확도를 보장하지는 않습니다.
 - Chromium에서 PDF 업로드, 번역 영역 넘침 방지, 문장 드래그·첨부, 채팅 출처·페이지, 그림 크롭·첨부, 그래프, 390px 화면 가로 넘침을 확인했습니다. 채팅 응답은 테스트 대역입니다.
-- 현재 클라우드에서 Mac mini의 vLLM에 직접 연결되지 않아 실제 Gemma 답변 품질과 이미지 추론은 아직 검증하지 못했습니다.
+- 현재 클라우드에서 Mac mini에 직접 연결되지 않아 새 E5의 MPS 처리 시간과 실제 Gemma 답변 품질·이미지 추론은 아직 검증하지 못했습니다.
 
 검증 생성물은 `data/inspection/rag-live-check/`, 화면 캡처는 `data/inspection/ui-check/`에 있으며 Git에는 포함하지 않습니다.
 

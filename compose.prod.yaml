@@ -7,6 +7,16 @@ services:
     restart: unless-stopped
     networks:
       - private
+    depends_on:
+      - qdrant
+
+  qdrant:
+    image: qdrant/qdrant:v1.19.0
+    volumes:
+      - qdrant-data:/qdrant/storage
+    restart: unless-stopped
+    networks:
+      - private
 
   caddy:
     image: caddy:2-alpine
@@ -32,3 +42,4 @@ volumes:
   readpaper-data:
   caddy-data:
   caddy-config:
+  qdrant-data:

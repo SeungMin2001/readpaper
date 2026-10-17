@@ -5,6 +5,7 @@ from collections import Counter
 import json
 from pathlib import Path
 import sys
+import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from readpaper.fulltext import collect_fulltext
@@ -39,9 +40,10 @@ async def run(args):
             print(f'{state}: {message}', flush=True)
         results = await collect_fulltext(selected, folder / 'sources', event)
     chunks = build_chunks(root['sentences'] if root else [], results, title)
-    metadata = await asyncio.to_thread(build_index, chunks, folder / 'index',
+    paper_id = uuid.uuid5(uuid.NAMESPACE_URL, str(folder)).hex
+    metadata = await asyncio.to_thread(build_index, chunks, folder / 'index', paper_id,
                                       lambda done, total: print(f'embedding: {done}/{total}', flush=True))
-    hits = await asyncio.to_thread(retrieve, args.query, chunks, 6, folder / 'index')
+    hits = await asyncio.to_thread(retrieve, args.query, chunks, 6, folder / 'index', paper_id)
     report = {'title': title, 'source_count': len(results),
               'kinds': dict(Counter(source['kind'] for source in results)),
               'fulltext': dict(Counter(source['fulltext_status'] for source in results)),

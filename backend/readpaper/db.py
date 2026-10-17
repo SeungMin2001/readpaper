@@ -76,6 +76,11 @@ def cleanup_expired() -> None:
             shutil.rmtree(directory, ignore_errors=True)
 
 
+def list_paper_ids() -> set[str]:
+    with connect() as db:
+        return {row["id"] for row in db.execute("SELECT id FROM papers")}
+
+
 def fail_interrupted_jobs() -> None:
     with connect() as db:
         db.execute(

@@ -12,6 +12,8 @@ from pathlib import Path
 from typing import Any, Literal
 
 import pymupdf
+import httpx
+from qdrant_client.http.exceptions import ApiException
 
 from fastapi import BackgroundTasks, Depends, FastAPI, File, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse
@@ -21,7 +23,7 @@ from . import db
 from .config import settings
 from .llm import InvalidModelOutput, ModelUnavailable, VLLMClient, close_model_transport, start_model_transport
 from .pdf import extract_pdf
-from .rag import INDEX_VERSION, build_chunks, build_index, retrieve
+from .rag import INDEX_VERSION, build_chunks, build_index, index_ready, prune_indexes, retrieve
 from .fulltext import collect_fulltext
 from .sources import SOURCE_DISCOVERY_VERSION, collect_external_sources
 from .terms import gloss_cache_key, resolve_term
@@ -132,6 +134,11 @@ async def _cleanup_loop() -> None:
     while True:
         await asyncio.sleep(60 * 60)
         await asyncio.to_thread(db.cleanup_expired)
+        if not settings.dev_mode:
+            try:
+                await asyncio.to_thread(prune_indexes, db.list_paper_ids())
+            except Exception:
+                logger.exception("Qdrant cleanup failed; the next cycle will retry")
 
 
 @app.on_event("startup")
@@ -142,6 +149,11 @@ async def startup() -> None:
     db.init_db()
     db.cleanup_expired()
     db.fail_interrupted_jobs()
+    if not settings.dev_mode:
+        try:
+            await asyncio.to_thread(prune_indexes, db.list_paper_ids())
+        except Exception:
+            logger.exception("Qdrant cleanup will retry after startup")
     await start_model_transport()
     _cleanup_task = asyncio.create_task(_cleanup_loop())
 
@@ -245,17 +257,19 @@ async def process_paper(paper_id: str) -> None:
         db.merge_paper_data(paper_id, {'external_sources': external})
         db.set_paper(paper_id, progress=75)
         db.add_paper_activity(paper_id, '본문 청킹 및 다국어 임베딩 생성 중')
-        chunks = build_chunks(payload["sentences"], external, payload["title"])
+        chunks = await asyncio.to_thread(build_chunks, payload["sentences"], external, payload["title"])
         db.merge_paper_data(paper_id, {"chunks": chunks})
         def report_index_progress(done: int, total: int) -> None:
             db.add_paper_activity(paper_id, f'임베딩 생성 {done}/{total}개')
             db.set_paper(paper_id, progress=75 + int(24 * done / total))
-        index = await asyncio.to_thread(build_index, chunks, directory / 'index', report_index_progress)
+        index = await asyncio.to_thread(build_index, chunks, directory / 'index',
+                                        paper_id, report_index_progress)
         index['fulltext_documents'] = sum(source.get('fulltext_status') == 'ready' for source in external)
         db.merge_paper_data(paper_id, {
             'rag_index': index, 'source_discovery_version': SOURCE_DISCOVERY_VERSION,
         })
         db.add_paper_activity(paper_id, f"검색 색인 저장: {len(chunks)}개 청크 · {index['dimensions']}차원", 'success')
+        db.add_paper_activity(paper_id, f"임베딩 API {index['embedding_ms'] / 1000:.1f}초 · 색인 전체 {index['index_ms'] / 1000:.1f}초", 'success')
         db.set_paper(paper_id, status="ready", progress=100, error="")
         db.add_paper_activity(paper_id, "원문·문헌·검색 문맥 준비 완료.", "success")
     except Exception:
@@ -359,7 +373,8 @@ async def upload_paper(background: BackgroundTasks, file: UploadFile = File(...)
                              cached['data'].get('source_discovery_version') != SOURCE_DISCOVERY_VERSION)
         needs_index = (cached['data'].get('rag_index', {}).get('version') != INDEX_VERSION or
                        cached['data'].get('rag_index', {}).get('model') != settings.embedding_model or
-                       not (directory / 'index' / 'vectors.npy').is_file())
+                       not index_ready(directory / 'index', cached['id'],
+                                       len(cached['data'].get('chunks', []))))
         if old_empty_sources or needs_index:
             db.set_paper(cached['id'], status='processing', progress=0)
             background.add_task(process_paper, cached['id'])
@@ -370,7 +385,6 @@ async def upload_paper(background: BackgroundTasks, file: UploadFile = File(...)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     parsed["content_hash"] = content_hash
-    parsed["chunks"] = build_chunks(parsed["sentences"], [], parsed["title"])
     paper_id = uuid.uuid4().hex
     directory = settings.data_dir / 'papers' / paper_id
     directory.mkdir(parents=True, exist_ok=True)
@@ -637,7 +651,8 @@ async def ask_paper(paper_id: str, body: QuestionRequest,
         english_query = await model.search_query(question)
         contexts = await asyncio.to_thread(retrieve, english_query + ' ' + body.question,
                                            paper['data']['chunks'], 6,
-                                           settings.data_dir / 'papers' / paper_id / 'index')
+                                           settings.data_dir / 'papers' / paper_id / 'index',
+                                           paper_id)
         contexts = selected_context + contexts[:6 - len(selected_context)]
         if not contexts:
             return {'answer': '수집한 자료에서 이 질문의 근거를 찾지 못했습니다.', 'citations': [], 'sources': []}
@@ -654,7 +669,8 @@ async def ask_paper(paper_id: str, body: QuestionRequest,
                 item['url'] = f'/api/papers/{paper_id}/sources/{document_id}/pdf' + (f"#page={source['page']}" if source.get('page') else '')
             selected.append(item)
         return result | {'sources': selected}
-    except (ModelUnavailable, InvalidModelOutput, ValueError, OSError) as exc:
+    except (ModelUnavailable, InvalidModelOutput, ValueError, OSError,
+            httpx.HTTPError, ApiException) as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 

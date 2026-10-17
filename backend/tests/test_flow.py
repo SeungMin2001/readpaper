@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 import pymupdf as fitz  # noqa: E402
 import httpx  # noqa: E402
+from qdrant_client import QdrantClient  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 from readpaper import db  # noqa: E402
@@ -89,10 +90,19 @@ async def fake_sources(title, doi, keywords, on_event=None, reference_text=""):
 
 class ReadpaperFlowTests(unittest.TestCase):
     def setUp(self):
-        from rag_fixtures import fake_embed
-        embeddings = patch('readpaper.rag.embed', fake_embed)
-        embeddings.start()
-        self.addCleanup(embeddings.stop)
+        from rag_fixtures import FakeRemoteE5Embeddings, FakeSparseEmbeddings, fake_token_count
+        qdrant_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(qdrant_directory.cleanup)
+        for target, replacement in (
+            ('readpaper.rag._token_count', fake_token_count),
+            ('readpaper.rag.RemoteE5Embeddings', FakeRemoteE5Embeddings),
+            ('readpaper.rag._sparse_embeddings', lambda: FakeSparseEmbeddings()),
+            ('readpaper.rag._qdrant_client',
+             lambda: QdrantClient(path=str(Path(qdrant_directory.name) / 'qdrant'))),
+        ):
+            substitute = patch(target, replacement)
+            substitute.start()
+            self.addCleanup(substitute.stop)
 
     def test_single_user_login_required_outside_development(self):
         with tempfile.TemporaryDirectory() as directory:

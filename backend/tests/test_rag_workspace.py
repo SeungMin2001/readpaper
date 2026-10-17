@@ -3,41 +3,62 @@ import json
 import os
 import tempfile
 import unittest
-from types import SimpleNamespace
+import uuid
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import httpx
-import numpy as np
 import pymupdf
 from fastapi.testclient import TestClient
+from qdrant_client import QdrantClient
 
 from readpaper import db
 from readpaper.config import Settings
 from readpaper.fulltext import collect_fulltext, download_pdf, parse_fulltext, public_url
 from readpaper.main import app
 from readpaper.llm import VLLMClient, InvalidModelOutput
-from readpaper.rag import build_chunks, build_index, retrieve
+from readpaper.rag import RemoteE5Embeddings, build_chunks, build_index, retrieve
 from test_flow import example_pdf, FakeVLLM, fake_sources
 
 
-from rag_fixtures import fake_embed
+from rag_fixtures import FakeRemoteE5Embeddings, FakeSparseEmbeddings, fake_token_count
 
 
 class RagWorkspaceTests(unittest.TestCase):
-    def test_long_embedding_inputs_include_overflow_windows(self):
-        seen = []
-        class Model:
-            model = SimpleNamespace(tokenizer=SimpleNamespace(encode=lambda text: SimpleNamespace(
-                offsets=[(0, 5)], overflowing=[SimpleNamespace(offsets=[(6, 12)])])))
-            def embed(self, texts, **kwargs):
-                seen.extend(texts)
-                return iter([np.array([1., 0.]), np.array([0., 1.])])
-        from readpaper.rag import embed
-        with patch('readpaper.rag.embedding_model', return_value=Model()):
-            result = embed(['first second'])
-        self.assertEqual(seen, ['first', 'second'])
-        np.testing.assert_allclose(result, [[2**-.5, 2**-.5]], rtol=1e-6)
+    def setUp(self):
+        qdrant_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(qdrant_directory.cleanup)
+        for target, replacement in (
+            ('readpaper.rag._token_count', fake_token_count),
+            ('readpaper.rag.RemoteE5Embeddings', FakeRemoteE5Embeddings),
+            ('readpaper.rag._sparse_embeddings', lambda: FakeSparseEmbeddings()),
+            ('readpaper.rag._qdrant_client',
+             lambda: QdrantClient(path=str(Path(qdrant_directory.name) / 'qdrant'))),
+        ):
+            substitute = patch(target, replacement)
+            substitute.start()
+            self.addCleanup(substitute.stop)
+
+    def test_remote_embedding_adapter_adds_e5_prefixes_and_batches(self):
+        requests = []
+        def respond(request):
+            body = json.loads(request.content)
+            requests.append(body['input'])
+            return httpx.Response(200, json={'data': [
+                {'index': index, 'embedding': [1.0] + [0.0] * 383}
+                for index in range(len(body['input']))
+            ]})
+        fake_client = httpx.Client(transport=httpx.MockTransport(respond),
+                                   base_url='http://mini:8002/v1/')
+        config = Settings(embedding_api_key='test-key',
+                          embedding_base_url='http://mini:8002/v1')
+        with patch('readpaper.rag.settings', config), \
+             patch('readpaper.rag.httpx.Client', return_value=fake_client):
+            with RemoteE5Embeddings() as adapter:
+                self.assertEqual(len(adapter.embed_documents(['alpha', 'beta'])), 2)
+                self.assertEqual(len(adapter.embed_query('gamma')), 384)
+        self.assertEqual(requests, [['passage: alpha', 'passage: beta'],
+                                    ['query: gamma']])
 
     def test_answer_sends_real_image_input_and_rejects_unknown_citations(self):
         requests = []
@@ -68,23 +89,30 @@ class RagWorkspaceTests(unittest.TestCase):
         for document in ('paper', 'external-1'):
             own = [chunk for chunk in chunks if chunk['document_id']==document]
             self.assertEqual({sid for c in own for sid in c['sentence_ids']}, {s['id'] for s in sentences})
-            self.assertTrue(all(len(c['text'].split()) <= 110 for c in own))
+            self.assertTrue(all(fake_token_count(c['text']) <= 400 for c in own))
             self.assertTrue(all(all(int(sid[1:])//4+1 == c['page'] for sid in c['sentence_ids']) for c in own))
 
-    def test_persistent_vectors_and_model_mismatch(self):
+    def test_qdrant_hybrid_index_and_model_mismatch(self):
         chunks = build_chunks([{'id':'s0','page':0,'text':'Robotic control learning.'},
                                {'id':'s1','page':1,'text':'Attention in language.'}], [], 'Root')
-        with tempfile.TemporaryDirectory() as directory, patch('readpaper.rag.embed', fake_embed):
+        with tempfile.TemporaryDirectory() as directory:
             path=Path(directory)
-            result=build_index(chunks,path)
-            self.assertEqual(result['dimensions'],3)
+            paper_id=uuid.uuid4().hex
+            result=build_index(chunks,path,paper_id)
+            self.assertEqual(result['dimensions'],384)
+            self.assertEqual(result['store'],'qdrant')
+            self.assertFalse((path/'vectors.npy').exists())
             stored=json.loads((path/'chunks.json').read_text())
             self.assertEqual(stored,chunks)
-            found=retrieve('robotic control', stored, directory=path)
+            found=retrieve('robotic control', stored, directory=path, paper_id=paper_id)
             self.assertEqual(found[0]['page'],1)
             result['model']='wrong-model'
             (path/'index.json').write_text(json.dumps(result))
-            with self.assertRaises(ValueError): retrieve('control',stored,directory=path)
+            with self.assertRaises(ValueError): retrieve('control',stored,directory=path,paper_id=paper_id)
+            with patch('readpaper.rag.RemoteE5Embeddings', side_effect=ValueError('embedding unavailable')):
+                with self.assertRaisesRegex(ValueError, 'embedding unavailable'):
+                    build_index(chunks,path,paper_id)
+            self.assertFalse((path/'index.json').exists())
 
     def test_download_does_not_accept_private_hosts_or_redirects(self):
         with self.assertRaises(ValueError): asyncio.run(public_url('http://example.com/file.pdf'))
@@ -129,15 +157,14 @@ class RagWorkspaceTests(unittest.TestCase):
             config=Settings(data_dir=Path(directory),dev_mode=True)
             model=RecordingModel()
             with patch('readpaper.db.settings',config), patch('readpaper.main.settings',config), \
-                 patch('readpaper.main.VLLMClient',return_value=model), patch('readpaper.main.collect_external_sources',fake_sources), \
-                 patch('readpaper.rag.embed',fake_embed):
+                 patch('readpaper.main.VLLMClient',return_value=model), patch('readpaper.main.collect_external_sources',fake_sources):
                 with TestClient(app) as client:
                     uploaded=client.post('/api/papers/upload',files={'file':('paper.pdf',example_pdf(),'application/pdf')})
                     pid=uploaded.json()['paper_id']
                     paper=client.get(f'/api/papers/{pid}').json()
                     self.assertEqual(paper['rag_index']['status'],'ready')
                     root=Path(directory)/'papers'/pid
-                    self.assertTrue((root/'index'/'vectors.npy').is_file())
+                    self.assertEqual(paper['rag_index']['store'],'qdrant')
                     attachment={'kind':'text','page':1,'word_ids':['w0','w1']}
                     result=client.post(f'/api/papers/{pid}/ask',json={'question':'이 뜻은?', 'attachments':[attachment],
                         'history':[{'role':'user','content':'이전 질문'}]})
@@ -166,13 +193,12 @@ class RagWorkspaceTests(unittest.TestCase):
             with patch('readpaper.db.settings',config), patch('readpaper.main.settings',config), \
                  patch('readpaper.main.VLLMClient',return_value=FakeVLLM()), patch('readpaper.main.collect_external_sources',fake_sources):
                 with TestClient(app) as client:
-                    with patch('readpaper.rag.embed',side_effect=ValueError('embedding unavailable')):
+                    with patch('readpaper.rag.RemoteE5Embeddings',side_effect=ValueError('embedding unavailable')):
                         uploaded=client.post('/api/papers/upload',files={'file':('paper.pdf',example_pdf(),'application/pdf')})
                     pid=uploaded.json()['paper_id']
                     self.assertEqual(client.get(f'/api/papers/{pid}').json()['status'],'failed')
                     self.assertEqual(client.post(f'/api/papers/{pid}/ask',json={'question':'질문'}).status_code,409)
-                    with patch('readpaper.rag.embed',fake_embed):
-                        self.assertEqual(client.post(f'/api/papers/{pid}/retry').status_code,200)
+                    self.assertEqual(client.post(f'/api/papers/{pid}/retry').status_code,200)
                     self.assertEqual(client.get(f'/api/papers/{pid}').json()['status'],'ready')
 
 

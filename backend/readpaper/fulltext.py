@@ -17,6 +17,12 @@ async def public_url(url: str) -> None:
     parsed = urlsplit(url)
     if parsed.scheme != 'https' or not parsed.hostname or parsed.username or parsed.port not in (None, 443):
         raise ValueError('공개 HTTPS PDF 주소가 아닙니다')
+    try:
+        literal_address = ipaddress.ip_address(parsed.hostname)
+    except ValueError:
+        literal_address = None
+    if literal_address is not None and not literal_address.is_global:
+        raise ValueError('사설 네트워크 주소는 수집할 수 없습니다')
     addresses = await asyncio.to_thread(socket.getaddrinfo, parsed.hostname, 443, type=socket.SOCK_STREAM)
     if not addresses or any(not ipaddress.ip_address(item[4][0]).is_global for item in addresses):
         raise ValueError('사설 네트워크 주소는 수집할 수 없습니다')
