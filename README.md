@@ -98,3 +98,14 @@ docker compose exec web python /app/backend/scripts/benchmark_gloss.py --latest-
 API의 `timing.first_token_ms`는 모델 요청부터 첫 텍스트 조각까지, `after_first_token_ms`는 그 뒤 응답 완료까지입니다. GPU 순수 연산 시간과는 다르며 네트워크·대기 시간을 포함합니다. 사용자 화면에는 브라우저에서 잰 클릭 후 응답 시간이 표시됩니다. 스트림은 서버에서 끝까지 받은 뒤 검증하므로 첫 토큰만 나온 시점을 번역 완료로 세지 않습니다. 실측 범위와 제한은 [성능 검증 기록](docs/gloss-performance.md)에 정리합니다.
 
 업로드 준비 시간은 PDF 길이와 Mac mini의 동시 처리 성능에 따라 달라집니다. 초기 로딩은 한 문장 요약과 문헌 전문 수집·임베딩을 준비합니다. 용어는 클릭할 때 번역하므로 첫 응답은 모델 추론 시간을 기다리고, 요약만 제공하므로 문장 단위 문맥이 필요한 다의어는 정확도가 낮아질 수 있습니다.
+
+### 임베딩 속도 비교
+
+저장된 동일 청크에 대해 기존 웹 서버 CPU MiniLM과 Mac mini E5 API의 임베딩 시간을 각각 측정합니다. 첫 명령은 기존 모델의 128토큰 초과 구간 처리까지 재현합니다. 두 번째 명령에는 실행 중인 Mac mini 임베딩 서버와 `READPAPER_EMBEDDING_BASE_URL`·`READPAPER_EMBEDDING_API_KEY`가 필요합니다.
+
+```bash
+python backend/scripts/benchmark_embeddings.py --chunks data/inspection/rag-live-check/index/chunks.json --mode legacy-cpu --repeats 2
+python backend/scripts/benchmark_embeddings.py --chunks data/inspection/rag-live-check/index/chunks.json --mode remote-e5 --repeats 2
+```
+
+다른 자료를 사용할 때는 `--chunks`를 해당 논문의 `index/chunks.json`으로 바꿉니다. `--json-out`으로 결과를 저장할 수 있습니다. `load_ms`는 모델·클라이언트 준비 시간, 각 `elapsed_ms`는 모든 청크의 임베딩 완료 시간입니다. 수집·청킹·Qdrant 색인 시간은 포함하지 않습니다. E5 측정에는 Mac과 클라우드 간 네트워크 왕복이 포함됩니다.

@@ -28,3 +28,5 @@ curl http://127.0.0.1:8002/v1/embeddings \
 클라우드의 `.env`에는 `READPAPER_EMBEDDING_BASE_URL=http://<Mac의 사설 VPN IP>:8002/v1`과 동일한 `READPAPER_EMBEDDING_API_KEY`를 설정합니다. 로컬 Docker Desktop에서 웹 앱을 실행한다면 기본 주소 `http://host.docker.internal:8002/v1`을 사용합니다. 서버는 E5의 `query: `·`passage: ` 접두부와 512토큰 한도를 검사합니다.
 
 색인 완료 시 웹 앱 진행 기록에 임베딩 API 호출 시간과 색인 전체 시간이 남고, 각 논문의 `index/index.json`에도 `embedding_ms`와 `index_ms`가 기록됩니다. 실제 성능 비교에는 같은 PDF·동일한 수집 결과로 반복 실행하고 Mac mini의 vLLM 동시 실행 여부를 기록해야 합니다.
+
+같은 청크 묶음으로 기존 CPU 모델과 E5 API를 비교하는 명령은 [프로젝트 README의 임베딩 속도 비교](../README.md#임베딩-속도-비교)에 있습니다. 이 측정은 임베딩 단계만 비교합니다.
