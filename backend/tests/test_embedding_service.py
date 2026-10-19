@@ -1,6 +1,5 @@
 import os
 import unittest
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -14,7 +13,7 @@ class EmbeddingServiceTests(unittest.TestCase):
         seen = []
 
         class Model:
-            tokenizer = SimpleNamespace(encode=lambda text, **_kwargs: text.split())
+            tokenizer = staticmethod(lambda texts, **_kwargs: {"length": [len(text.split()) for text in texts]})
 
             def encode(self, texts, **_kwargs):
                 seen.extend(texts)

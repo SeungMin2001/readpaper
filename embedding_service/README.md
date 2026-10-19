@@ -29,4 +29,6 @@ curl http://127.0.0.1:8002/v1/embeddings \
 
 색인 완료 시 웹 앱 진행 기록에 임베딩 API 호출 시간과 색인 전체 시간이 남고, 각 논문의 `index/index.json`에도 `embedding_ms`와 `index_ms`가 기록됩니다. 실제 성능 비교에는 같은 PDF·동일한 수집 결과로 반복 실행하고 Mac mini의 vLLM 동시 실행 여부를 기록해야 합니다.
 
-같은 청크 묶음으로 기존 CPU 모델과 E5 API를 비교하는 명령은 [프로젝트 README의 임베딩 속도 비교](../README.md#임베딩-속도-비교)에 있습니다. 이 측정은 임베딩 단계만 비교합니다.
+API 응답의 `timing.inference_ms`는 모델 연산, `timing.queue_ms`는 임베딩 요청 간 대기, `timing.tokenize_ms`는 입력 검증 시간입니다. 웹 앱도 서버 연산·대기 시간을 합산해 기록합니다. vLLM과 GPU를 함께 쓰며 발생하는 경합은 연산 시간에 포함될 수 있습니다.
+
+같은 청크 묶음으로 기존 CPU 모델과 E5 API를 비교하는 명령은 [RAG 검증 문서](../docs/workspace-rag.md#임베딩-속도-비교)에 있습니다. 이 측정은 임베딩 단계만 비교합니다.

@@ -22,8 +22,9 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from tokenizers import Tokenizer
 
 from .config import settings
+from . import embedding_cache
 
-INDEX_VERSION = 4
+INDEX_VERSION = 5
 EMBEDDING_DIMENSIONS = 384
 CHUNK_TOKENS = 400
 OVERLAP_TOKENS = 55
@@ -46,7 +47,7 @@ def _tokenizer() -> Tokenizer:
 
 
 def _token_count(text: str) -> int:
-    return len(_tokenizer().encode(text).ids)
+    return len(_tokenizer().encode(text, add_special_tokens=False).ids)
 
 
 def _section_heading(text: str) -> str | None:
@@ -64,10 +65,23 @@ def build_chunks(sentences: list[dict[str, Any]], external_sources: list[dict[st
                  paper_title: str) -> list[dict[str, Any]]:
     """Preserve page, section and sentence provenance while sizing by E5 tokens."""
     chunks: list[dict[str, Any]] = []
+    # Splitters repeatedly count the same separators and sentence fragments.
+    # Scope the cache to this build so paper text is released afterwards.
+    token_count = lru_cache(maxsize=8192)(_token_count)
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_TOKENS, chunk_overlap=OVERLAP_TOKENS,
-        length_function=_token_count, separators=["\n\n", "\n", ". ", " ", ""],
+        length_function=token_count, separators=["\n\n", "\n", ". ", " ", ""],
     )
+
+    def bounded_parts(text: str):
+        if token_count(text) <= CHUNK_TOKENS:
+            yield text
+            return
+        middle = text.rfind(" ", 0, len(text) // 2)
+        if middle < 1:
+            middle = len(text) // 2
+        yield from bounded_parts(text[:middle].strip())
+        yield from bounded_parts(text[middle:].strip())
     documents = [{"id": "paper", "kind": "paper", "title": paper_title,
                   "url": None, "content_scope": "full_text", "sentences": sentences}] + external_sources
     for source in documents:
@@ -86,34 +100,43 @@ def build_chunks(sentences: list[dict[str, Any]], external_sources: list[dict[st
                 section = heading
                 continue
             for part in splitter.split_text(row["text"].strip()):
-                if part.strip():
-                    units.append({"id": row["id"], "page": row.get("page"),
-                                  "block": row.get("block"), "section": section,
-                                  "text": part.strip()})
+                for bounded in bounded_parts(part.strip()):
+                    if bounded:
+                        units.append({"id": row["id"], "page": row.get("page"),
+                                      "block": row.get("block"), "section": section,
+                                      "text": bounded})
 
         group: list[dict[str, Any]] = []
         length = 0
         chunk_no = 0
 
-        def save_group() -> None:
+        def save_group(items=None) -> None:
             nonlocal chunk_no
-            if not group:
+            current = group if items is None else items
+            if not current:
                 return
-            page = group[0]["page"]
+            text = " ".join(item["text"] for item in current)
+            # Token counts can change at sentence joins. Check once per final
+            # chunk, instead of re-tokenizing a growing paragraph every step.
+            if len(current) > 1 and token_count(text) > CHUNK_TOKENS:
+                save_group(current[:-1])
+                save_group(current[-1:])
+                return
+            page = current[0]["page"]
             chunks.append({
                 "id": f"{source['id']}-chunk-{chunk_no}", "document_id": source["id"],
                 "kind": source["kind"], "title": source["title"], "url": source.get("url"),
                 "content_scope": source.get("content_scope", "abstract"),
                 "page": page + 1 if page is not None else None,
-                "section": group[0]["section"],
-                "text": " ".join(item["text"] for item in group),
-                "sentences": [{"id": item["id"], "text": item["text"]} for item in group],
-                "sentence_ids": list(dict.fromkeys(item["id"] for item in group)),
+                "section": current[0]["section"],
+                "text": text,
+                "sentences": [{"id": item["id"], "text": item["text"]} for item in current],
+                "sentence_ids": list(dict.fromkeys(item["id"] for item in current)),
             })
             chunk_no += 1
 
         for unit in units:
-            size = _token_count(unit["text"])
+            size = token_count(unit["text"])
             boundary = bool(group and (
                 unit["page"] != group[0]["page"] or
                 unit["section"] != group[0]["section"]
@@ -126,15 +149,15 @@ def build_chunks(sentences: list[dict[str, Any]], external_sources: list[dict[st
                 if not boundary and not new_block:
                     carried_tokens = 0
                     for previous in reversed(group):
-                        token_count = _token_count(previous["text"])
-                        if carried_tokens + token_count > OVERLAP_TOKENS:
+                        previous_size = token_count(previous["text"])
+                        if carried_tokens + previous_size > OVERLAP_TOKENS:
                             break
                         carry.insert(0, previous)
-                        carried_tokens += token_count
+                        carried_tokens += previous_size
                 if carry and carried_tokens + size > CHUNK_TOKENS:
                     carry = []
                 group = carry
-                length = sum(_token_count(item["text"]) for item in group)
+                length = sum(token_count(item["text"]) for item in group)
             group.append(unit)
             length += size
         save_group()
@@ -144,7 +167,7 @@ def build_chunks(sentences: list[dict[str, Any]], external_sources: list[dict[st
 class RemoteE5Embeddings(Embeddings):
     """LangChain embeddings adapter for the Mac mini's batched API."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, cache_documents: bool = True) -> None:
         if not settings.embedding_api_key:
             raise ValueError("READPAPER_EMBEDDING_API_KEY가 필요합니다.")
         self.client = httpx.Client(
@@ -153,6 +176,11 @@ class RemoteE5Embeddings(Embeddings):
             timeout=httpx.Timeout(120, connect=8),
         )
         self.elapsed_ms = 0.0
+        self.cache_hits = 0
+        self.generated_texts = 0
+        self.cache_documents = cache_documents
+        self.server_inference_ms = 0.0
+        self.server_queue_ms = 0.0
 
     def close(self) -> None:
         self.client.close()
@@ -173,7 +201,13 @@ class RemoteE5Embeddings(Embeddings):
             })
             response.raise_for_status()
             self.elapsed_ms += (time.monotonic() - started) * 1000
-            data = response.json().get("data", [])
+            payload = response.json()
+            timing = payload.get("timing") or {}
+            for field, attribute in (("inference_ms", "server_inference_ms"), ("queue_ms", "server_queue_ms")):
+                value = timing.get(field)
+                if isinstance(value, (float, int)) and math.isfinite(value) and value >= 0:
+                    setattr(self, attribute, getattr(self, attribute) + value)
+            data = payload.get("data", [])
             if len(data) != len(batch):
                 raise ValueError("임베딩 서버의 결과 개수가 일치하지 않습니다.")
             for index, item in enumerate(data):
@@ -187,7 +221,22 @@ class RemoteE5Embeddings(Embeddings):
         return vectors
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
-        return self._embed(["passage: " + text for text in texts])
+        prefixed = ["passage: " + text for text in texts]
+        if not self.cache_documents:
+            vectors = self._embed(prefixed)
+            self.generated_texts += len(texts)
+            return vectors
+        keys = [embedding_cache.cache_key(text) for text in prefixed]
+        cached = embedding_cache.read(keys)
+        missing = {key: text for key, text in zip(keys, prefixed) if key not in cached}
+        self.cache_hits += len(texts) - len(missing)
+        if missing:
+            vectors = self._embed(list(missing.values()))
+            fresh = dict(zip(missing, vectors))
+            embedding_cache.write(fresh)
+            cached.update(fresh)
+            self.generated_texts += len(fresh)
+        return [cached[key] for key in keys]
 
     def embed_query(self, text: str) -> list[float]:
         return self._embed(["query: " + text])[0]
@@ -226,23 +275,28 @@ def _document(chunk: dict[str, Any]) -> Document:
 
 
 def build_index(chunks: list[dict[str, Any]], directory: Path, paper_id: str,
-                on_progress=None) -> dict[str, Any]:
+                on_progress=None, *, extend: bool = False) -> dict[str, Any]:
     if not chunks:
         raise ValueError("검색할 본문이 없습니다")
     started = time.monotonic()
     directory.mkdir(parents=True, exist_ok=True)
-    (directory / "index.json").unlink(missing_ok=True)
+    if not extend:
+        (directory / "index.json").unlink(missing_ok=True)
     client = _qdrant_client()
     name = _collection_name(paper_id)
     try:
-        if client.collection_exists(name):
+        exists = client.collection_exists(name)
+        if extend and not exists:
+            raise ValueError("추가 색인의 원문 컬렉션이 없습니다.")
+        if exists and not extend:
             client.delete_collection(name)
-        client.create_collection(
-            collection_name=name,
-            vectors_config={"dense": models.VectorParams(size=EMBEDDING_DIMENSIONS,
-                                                           distance=models.Distance.COSINE)},
-            sparse_vectors_config={"bm25": models.SparseVectorParams(modifier=models.Modifier.IDF)},
-        )
+        if not extend:
+            client.create_collection(
+                collection_name=name,
+                vectors_config={"dense": models.VectorParams(size=EMBEDDING_DIMENSIONS,
+                                                               distance=models.Distance.COSINE)},
+                sparse_vectors_config={"bm25": models.SparseVectorParams(modifier=models.Modifier.IDF)},
+            )
         with RemoteE5Embeddings() as embeddings:
             store = _store(client, paper_id, embeddings)
             for offset in range(0, len(chunks), 64):
@@ -255,6 +309,10 @@ def build_index(chunks: list[dict[str, Any]], directory: Path, paper_id: str,
                 if on_progress:
                     on_progress(min(offset + len(batch), len(chunks)), len(chunks))
             embedding_ms = round(embeddings.elapsed_ms, 2)
+            cache_hits = getattr(embeddings, "cache_hits", 0)
+            generated_texts = getattr(embeddings, "generated_texts", len(chunks))
+            server_inference_ms = getattr(embeddings, "server_inference_ms", 0.0)
+            server_queue_ms = getattr(embeddings, "server_queue_ms", 0.0)
         (directory / "chunks.json").write_text(
             json.dumps(chunks, ensure_ascii=False, indent=2), encoding="utf-8",
         )
@@ -263,14 +321,19 @@ def build_index(chunks: list[dict[str, Any]], directory: Path, paper_id: str,
             "chunks": len(chunks), "dimensions": EMBEDDING_DIMENSIONS,
             "version": INDEX_VERSION, "store": "qdrant", "collection": name,
             "embedding_ms": embedding_ms,
+            "cache_hits": cache_hits, "generated_texts": generated_texts,
+            "server_inference_ms": round(server_inference_ms, 2),
+            "server_queue_ms": round(server_queue_ms, 2),
             "index_ms": round((time.monotonic() - started) * 1000, 2),
         }
-        (directory / "index.json").write_text(json.dumps(metadata), encoding="utf-8")
+        metadata_path = directory / "index.tmp"
+        metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+        metadata_path.replace(directory / "index.json")
         (directory / "vectors.npy").unlink(missing_ok=True)
         return metadata
     except Exception:
         try:
-            if client.collection_exists(name):
+            if not extend and client.collection_exists(name):
                 client.delete_collection(name)
         except Exception:
             pass
@@ -314,22 +377,40 @@ def _lexical(texts: tuple[str, ...]):
     return vectorizer, vectorizer.fit_transform(texts)
 
 
+def question_document(question: str) -> str | None:
+    """Read the uploaded paper by default; widen explicit literature questions."""
+    external = re.search(
+        r"관련\s*(?:논문|연구)|다른\s*(?:논문|연구)|참고\s*문헌|피인용|인용한|인용된|비교|"
+        r"\b(?:related|references?|citing|cited|compare|comparison|other papers)\b",
+        question, re.IGNORECASE,
+    )
+    return None if external else "paper"
+
+
 def retrieve(query: str, chunks: list[dict[str, Any]], limit: int = 6,
-             directory: Path | None = None, paper_id: str | None = None) -> list[dict[str, Any]]:
+             directory: Path | None = None, paper_id: str | None = None,
+             document_id: str | None = None) -> list[dict[str, Any]]:
     if not chunks or not query.strip():
         return []
     if directory is None:
+        if document_id:
+            chunks = [item for item in chunks if item.get("document_id") == document_id]
+        if not chunks:
+            return []
         vectorizer, matrix = _lexical(tuple(item["text"] for item in chunks))
         scores = (matrix @ vectorizer.transform([query]).T).toarray().ravel()
         return [chunks[i] | {"score": round(float(scores[i]), 4)}
                 for i in np.argsort(-scores)[:limit] if scores[i] > 0]
-    if not paper_id or not index_ready(directory, paper_id, len(chunks)):
+    if not paper_id or not index_ready(directory, paper_id):
         raise ValueError("검색 색인이 변경되었거나 사용할 수 없습니다. 문헌을 다시 준비해 주세요.")
     client = _qdrant_client()
     try:
         with RemoteE5Embeddings() as embeddings:
+            scope = models.Filter(must=[models.FieldCondition(
+                key="metadata.document_id", match=models.MatchValue(value=document_id),
+            )]) if document_id else None
             hits = _store(client, paper_id, embeddings).similarity_search_with_score(
-                query, k=max(limit * 4, 20),
+                query, k=max(limit * 4, 20), filter=scope,
             )
     finally:
         client.close()

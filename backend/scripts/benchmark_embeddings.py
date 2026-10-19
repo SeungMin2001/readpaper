@@ -61,7 +61,8 @@ def benchmark(mode: str, texts: list[str], repeats: int) -> dict:
         engine = TextEmbedding(LEGACY_MODEL, cache_dir=str(cache), threads=2)
         model = LEGACY_MODEL
     else:
-        engine = RemoteE5Embeddings()
+        # Measure inference on every repeat, not the application's disk cache.
+        engine = RemoteE5Embeddings(cache_documents=False)
         model = settings.embedding_model
     load_ms = round((time.monotonic() - started) * 1000, 2)
     runs = []

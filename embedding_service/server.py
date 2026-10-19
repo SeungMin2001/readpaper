@@ -59,16 +59,21 @@ def embeddings(request: EmbeddingRequest) -> dict:
         raise HTTPException(status_code=422, detail="Expected 1-128 non-empty texts")
     if any(not text.startswith(("query: ", "passage: ")) for text in texts):
         raise HTTPException(status_code=422, detail="E5 inputs need a query: or passage: prefix")
-    token_lengths = [len(app.state.model.tokenizer.encode(text, add_special_tokens=True))
-                     for text in texts]
+    started = time.monotonic()
+    # Tokenize validation as a batch instead of crossing Python/Rust per chunk.
+    token_lengths = app.state.model.tokenizer(
+        texts, add_special_tokens=True, return_length=True, truncation=False, padding=False,
+    )["length"]
     if any(length > 512 for length in token_lengths):
         raise HTTPException(status_code=422, detail="E5 inputs must fit within 512 tokens")
-    started = time.monotonic()
+    tokenized = time.monotonic()
     with _lock:
+        inference_started = time.monotonic()
         vectors = app.state.model.encode(
             texts, batch_size=app.state.batch_size, normalize_embeddings=True,
             convert_to_numpy=True, show_progress_bar=False,
         )
+        encoded = time.monotonic()
     return {
         "object": "list", "model": MODEL_ID,
         "data": [
@@ -76,5 +81,10 @@ def embeddings(request: EmbeddingRequest) -> dict:
             for index, vector in enumerate(vectors)
         ],
         "usage": {"prompt_tokens": sum(token_lengths), "total_tokens": sum(token_lengths)},
-        "elapsed_ms": round((time.monotonic() - started) * 1000, 2),
+        "elapsed_ms": round((encoded - started) * 1000, 2),
+        "timing": {
+            "tokenize_ms": round((tokenized - started) * 1000, 2),
+            "queue_ms": round((inference_started - tokenized) * 1000, 2),
+            "inference_ms": round((encoded - inference_started) * 1000, 2),
+        },
     }

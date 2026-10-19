@@ -23,7 +23,7 @@ from . import db
 from .config import settings
 from .llm import InvalidModelOutput, ModelUnavailable, VLLMClient, close_model_transport, start_model_transport
 from .pdf import extract_pdf
-from .rag import INDEX_VERSION, build_chunks, build_index, index_ready, prune_indexes, retrieve
+from .rag import INDEX_VERSION, build_chunks, build_index, index_ready, prune_indexes, retrieve, question_document
 from .fulltext import collect_fulltext
 from .sources import SOURCE_DISCOVERY_VERSION, collect_external_sources
 from .terms import gloss_cache_key, resolve_term
@@ -207,6 +207,7 @@ async def process_paper(paper_id: str) -> None:
     if paper is None:
         return
     payload = paper["data"]
+    root_ready = False
     try:
         db.clear_paper_activity(paper_id)
         db.set_paper(paper_id, status="processing", progress=3, error="")
@@ -215,6 +216,18 @@ async def process_paper(paper_id: str) -> None:
             f"PDF 읽기 완료: {len(payload['pages'])}페이지, {len(payload['sentences'])}문장",
             "success",
         )
+        directory = settings.data_dir / 'papers' / paper_id
+        db.add_paper_activity(paper_id, '업로드 논문의 검색 근거를 먼저 준비하는 중')
+        root_started = time.monotonic()
+        root_chunks = await asyncio.to_thread(build_chunks, payload['sentences'], [], payload['title'])
+        root_index = await asyncio.to_thread(build_index, root_chunks, directory / 'index', paper_id)
+        db.merge_paper_data(paper_id, {'chunks': root_chunks, 'rag_index': root_index})
+        root_ready = True
+        db.set_paper(paper_id, progress=15)
+        db.add_paper_activity(paper_id,
+            f"원문 검색 준비 완료: {len(root_chunks)}개 · {time.monotonic() - root_started:.1f}초. 외부 문헌을 추가 수집합니다.",
+            'success')
+        db.add_paper_activity(paper_id, f"원문 임베딩 API {root_index['embedding_ms'] / 1000:.1f}초 · 재사용 {root_index['cache_hits']}개", 'success')
 
         async def report_collection_event(message: str, state: str = "info") -> None:
             db.add_paper_activity(paper_id, message, state)
@@ -252,27 +265,38 @@ async def process_paper(paper_id: str) -> None:
             db.add_paper_activity(paper_id, warning, "warning")
 
         db.set_paper(paper_id, progress=50)
-        directory = settings.data_dir / 'papers' / paper_id
         external = await collect_fulltext(external, directory / 'sources', report_collection_event)
         db.merge_paper_data(paper_id, {'external_sources': external})
         db.set_paper(paper_id, progress=75)
         db.add_paper_activity(paper_id, '본문 청킹 및 다국어 임베딩 생성 중')
+        chunk_started = time.monotonic()
         chunks = await asyncio.to_thread(build_chunks, payload["sentences"], external, payload["title"])
-        db.merge_paper_data(paper_id, {"chunks": chunks})
+        chunk_ms = round((time.monotonic() - chunk_started) * 1000, 2)
+        db.add_paper_activity(paper_id, f'청킹 완료: {len(chunks)}개 · {chunk_ms / 1000:.1f}초', 'success')
         def report_index_progress(done: int, total: int) -> None:
             db.add_paper_activity(paper_id, f'임베딩 생성 {done}/{total}개')
             db.set_paper(paper_id, progress=75 + int(24 * done / total))
         index = await asyncio.to_thread(build_index, chunks, directory / 'index',
-                                        paper_id, report_index_progress)
+                                        paper_id, report_index_progress, extend=True)
         index['fulltext_documents'] = sum(source.get('fulltext_status') == 'ready' for source in external)
+        index['chunk_ms'] = chunk_ms
         db.merge_paper_data(paper_id, {
-            'rag_index': index, 'source_discovery_version': SOURCE_DISCOVERY_VERSION,
+            'chunks': chunks, 'rag_index': index, 'source_discovery_version': SOURCE_DISCOVERY_VERSION,
         })
         db.add_paper_activity(paper_id, f"검색 색인 저장: {len(chunks)}개 청크 · {index['dimensions']}차원", 'success')
         db.add_paper_activity(paper_id, f"임베딩 API {index['embedding_ms'] / 1000:.1f}초 · 색인 전체 {index['index_ms'] / 1000:.1f}초", 'success')
+        db.add_paper_activity(paper_id, f"임베딩 재사용 {index['cache_hits']}개 · 새로 생성 {index['generated_texts']}개", 'success')
+        if index['server_inference_ms'] or index['server_queue_ms']:
+            db.add_paper_activity(paper_id, f"임베딩 서버 연산 {index['server_inference_ms'] / 1000:.1f}초 · 대기 {index['server_queue_ms'] / 1000:.1f}초", 'success')
         db.set_paper(paper_id, status="ready", progress=100, error="")
         db.add_paper_activity(paper_id, "원문·문헌·검색 문맥 준비 완료.", "success")
     except Exception:
+        if root_ready:
+            db.set_paper(paper_id, status='ready', progress=100,
+                         error='외부 문헌 추가 준비에 실패했습니다. 업로드 논문으로 질문할 수 있으며 문헌 수집을 재시도할 수 있습니다.')
+            db.add_paper_activity(paper_id, '외부 문헌 준비 실패. 원문 검색은 사용할 수 있습니다.', 'warning')
+            logger.exception('External indexing failed; preserving root index for %s', paper_id)
+            return
         db.set_paper(paper_id, status="failed", error="논문 분석 중 오류가 발생했습니다. 서버 로그를 확인하세요.")
         db.add_paper_activity(paper_id, "분석 중 예기치 못한 오류가 발생했습니다", "error")
         raise
@@ -369,6 +393,9 @@ async def upload_paper(background: BackgroundTasks, file: UploadFile = File(...)
         directory = settings.data_dir / 'papers' / cached['id']
         directory.mkdir(parents=True, exist_ok=True)
         (directory / 'original.pdf').write_bytes(data)
+        if cached['status'] == 'processing':
+            _start_gloss_preparation(cached['id'], cached['data'], background)
+            return {"paper_id": cached['id'], "status": "processing", "cached": True}
         old_empty_sources = (not cached['data'].get('external_sources') and
                              cached['data'].get('source_discovery_version') != SOURCE_DISCOVERY_VERSION)
         needs_index = (cached['data'].get('rag_index', {}).get('version') != INDEX_VERSION or
@@ -638,7 +665,7 @@ async def ask_paper(paper_id: str, body: QuestionRequest,
     paper = db.get_paper(paper_id)
     if paper is None:
         raise HTTPException(404, '논문이 없습니다.')
-    if paper['status'] != 'ready' or not paper['data'].get('rag_index'):
+    if paper['status'] == 'failed' or paper['data'].get('rag_index', {}).get('status') != 'ready':
         raise HTTPException(409, '문헌 검색 준비를 완료한 뒤 질문해 주세요.')
     model = VLLMClient()
     selected_context = selection_contexts(paper, body.attachments)
@@ -646,13 +673,24 @@ async def ask_paper(paper_id: str, body: QuestionRequest,
     # History is conversational context, never indexed evidence.
     import json
     question = json.dumps({'question': body.question, 'history': history,
+                           'uploaded_paper': {'title': paper['title'],
+                                              'summary': paper['data'].get('paper_summary', '')},
                            'selected_text': [item['text'][:300] for item in selected_context]}, ensure_ascii=False)
     try:
+        started = time.monotonic()
         english_query = await model.search_query(question)
+        scope = question_document(body.question)
+        if not any(item.get('document_id') != 'paper' for item in paper['data']['chunks']):
+            scope = 'paper'
         contexts = await asyncio.to_thread(retrieve, english_query + ' ' + body.question,
                                            paper['data']['chunks'], 6,
                                            settings.data_dir / 'papers' / paper_id / 'index',
-                                           paper_id)
+                                           paper_id, document_id=scope)
+        logger.info("RAG retrieval paper=%s scope=%s hits=%d root_hits=%d elapsed_ms=%.1f",
+                    paper_id, scope or 'all', len(contexts),
+                    sum(item.get('document_id') == 'paper' for item in contexts),
+                    (time.monotonic() - started) * 1000)
+        db.add_paper_activity(paper_id, f"질문 검색: {len(contexts)}개 근거 (원문 {sum(item.get('document_id') == 'paper' for item in contexts)}개)")
         contexts = selected_context + contexts[:6 - len(selected_context)]
         if not contexts:
             return {'answer': '수집한 자료에서 이 질문의 근거를 찾지 못했습니다.', 'citations': [], 'sources': []}

@@ -314,7 +314,7 @@ export default function App() {
   const currentPage = paper?.pages?.[pageIndex];
   const canAsk = Boolean(
     paperId &&
-    paper?.status === "ready" &&
+    paper?.status !== "failed" &&
     paper?.rag_index?.status === "ready",
   );
 
@@ -631,7 +631,8 @@ export default function App() {
     (uploading ||
       !paper ||
       glossPreparation?.status !== "completed" ||
-      paper.status !== "ready"),
+      paper.status === "failed" ||
+      paper.rag_index?.status !== "ready"),
   );
 
   return (
@@ -639,7 +640,7 @@ export default function App() {
       <header className="site-header">
         <Brand />
         <div className="header-right">
-          {paper?.status === "ready" && !preparingSummary && (
+          {paper?.rag_index?.status === "ready" && !preparingSummary && (
             <span className="header-state">
               <span className="status-dot" /> 읽을 준비가 됐어요
             </span>
@@ -745,7 +746,7 @@ export default function App() {
                 ? "준비를 완료하지 못했습니다."
                 : glossPreparation?.stage === "summarizing"
                   ? "논문의 핵심을 읽고 있어요."
-                  : "연결된 연구를 준비하고 있어요."}
+                  : "논문을 읽을 준비를 하고 있어요."}
             </h1>
             <p className="preparation-title">{paper?.title || fileName}</p>
             {glossPreparation?.status !== "failed" &&
@@ -762,7 +763,7 @@ export default function App() {
               <p className="preparation-summary">{glossPreparation.summary}</p>
             )}
             <p className="preparation-note">
-              인용·관련 논문 수집 → 본문 읽기 → 검색 준비
+              원문 요약과 검색을 먼저 준비해요. 외부 문헌은 읽는 동안 추가합니다.
             </p>
             <ActivityLog
               activity={paper?.activity || []}
@@ -835,7 +836,7 @@ export default function App() {
               <span>{fileName}</span>
             </div>
             <div className="toolbar-actions">
-              {paper?.status === "ready" && (
+              {paper?.rag_index?.status === "ready" && (
                 <span className="ready-label">
                   <span className="status-dot" /> READY
                 </span>

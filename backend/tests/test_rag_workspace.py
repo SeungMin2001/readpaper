@@ -15,9 +15,9 @@ from qdrant_client import QdrantClient
 from readpaper import db
 from readpaper.config import Settings
 from readpaper.fulltext import collect_fulltext, download_pdf, parse_fulltext, public_url
-from readpaper.main import app
+from readpaper.main import app, ask_paper, QuestionRequest
 from readpaper.llm import VLLMClient, InvalidModelOutput
-from readpaper.rag import RemoteE5Embeddings, build_chunks, build_index, retrieve
+from readpaper.rag import RemoteE5Embeddings, build_chunks, build_index, retrieve, question_document
 from test_flow import example_pdf, FakeVLLM, fake_sources
 
 
@@ -50,15 +50,95 @@ class RagWorkspaceTests(unittest.TestCase):
             ]})
         fake_client = httpx.Client(transport=httpx.MockTransport(respond),
                                    base_url='http://mini:8002/v1/')
-        config = Settings(embedding_api_key='test-key',
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        config = Settings(data_dir=Path(temporary.name), embedding_api_key='test-key',
                           embedding_base_url='http://mini:8002/v1')
         with patch('readpaper.rag.settings', config), \
+             patch('readpaper.embedding_cache.settings', config), \
              patch('readpaper.rag.httpx.Client', return_value=fake_client):
             with RemoteE5Embeddings() as adapter:
                 self.assertEqual(len(adapter.embed_documents(['alpha', 'beta'])), 2)
                 self.assertEqual(len(adapter.embed_query('gamma')), 384)
         self.assertEqual(requests, [['passage: alpha', 'passage: beta'],
                                     ['query: gamma']])
+
+    def test_empty_citation_array_recovers_inline_ids_and_retries_missing_ids(self):
+        contexts = [{'id': 'paper-chunk-0', 'title': 'Root', 'text': 'The method optimizes a policy.'}]
+        async def run():
+            with patch.object(VLLMClient, 'chat_json', new_callable=AsyncMock) as chat:
+                chat.return_value = {'answer': '정책을 최적화합니다 [paper-chunk-0]', 'citations': []}
+                result = await VLLMClient().answer('핵심 방법', contexts)
+                self.assertEqual(result['citations'], ['paper-chunk-0'])
+                self.assertEqual(chat.await_count, 1)
+                chat.reset_mock()
+                chat.side_effect = [
+                    {'answer': '정책을 최적화합니다', 'citations': []},
+                    {'answer': '정책을 최적화합니다', 'citations': ['paper-chunk-0']},
+                ]
+                self.assertEqual((await VLLMClient().answer('핵심 방법', contexts))['citations'], ['paper-chunk-0'])
+                self.assertEqual(chat.await_count, 2)
+                chat.side_effect = None
+                chat.return_value = {'answer': '정책을 최적화합니다', 'citations': []}
+                with self.assertRaisesRegex(InvalidModelOutput, '근거는 검색했지만'):
+                    await VLLMClient().answer('핵심 방법', contexts)
+                chat.return_value = {'answer': '실험 수치가 없어 성능 차이를 판단할 수 없습니다.',
+                                     'citations': [], 'insufficient_evidence': True}
+                self.assertIn('실험 수치', (await VLLMClient().answer('성능 차이', contexts))['answer'])
+        asyncio.run(run())
+
+    def test_original_paper_remains_available_during_and_after_external_failure(self):
+        class RecordingModel(FakeVLLM):
+            async def search_query(self, question):
+                self.request = json.loads(question)
+                return 'policy optimization main method'
+        model = RecordingModel()
+        async def failing_sources(*args, **kwargs):
+            with db.connect() as connection:
+                pid = connection.execute('SELECT id FROM papers').fetchone()['id']
+            paper = db.get_paper(pid, touch=False)
+            self.assertEqual(paper['status'], 'processing')
+            self.assertEqual(paper['data']['rag_index']['status'], 'ready')
+            result = await ask_paper(pid, QuestionRequest(question='핵심 방법을 쉽게 설명해줘'), _user='developer')
+            self.assertTrue(result['sources'])
+            self.assertTrue(all(source['document_id'] == 'paper' for source in result['sources']))
+            self.assertEqual(model.request['uploaded_paper']['title'], paper['title'])
+            raise ValueError('external collection unavailable')
+        with tempfile.TemporaryDirectory() as directory:
+            config = Settings(data_dir=Path(directory), dev_mode=True)
+            with patch('readpaper.db.settings', config), patch('readpaper.main.settings', config), \
+                 patch('readpaper.main.VLLMClient', return_value=model), \
+                 patch('readpaper.main.collect_external_sources', failing_sources):
+                with TestClient(app) as client:
+                    uploaded = client.post('/api/papers/upload', files={'file': ('paper.pdf', example_pdf(), 'application/pdf')})
+                    pid = uploaded.json()['paper_id']
+                    paper = client.get(f'/api/papers/{pid}').json()
+                    self.assertEqual(paper['status'], 'ready')
+                    self.assertIn('외부 문헌', paper['error'])
+                    result = client.post(f'/api/papers/{pid}/ask', json={'question': '핵심 방법을 쉽게 설명해줘'})
+                    self.assertEqual(result.status_code, 200, result.text)
+                    self.assertTrue(result.json()['sources'])
+
+    def test_hybrid_document_filter_and_failed_extension_preserve_root(self):
+        chunks = build_chunks([{'id': 's0', 'page': 0, 'text': 'Policy optimization in robotic control.'}],
+            [{'id': 'external-0', 'kind': 'related', 'title': 'Other',
+              'text': 'Robotic control policy optimization.'}], 'Root')
+        with tempfile.TemporaryDirectory() as directory:
+            path, paper_id = Path(directory), uuid.uuid4().hex
+            root = [chunk for chunk in chunks if chunk['document_id'] == 'paper']
+            build_index(root, path, paper_id)
+            original = (path / 'index.json').read_text()
+            with patch('readpaper.rag.RemoteE5Embeddings', side_effect=ValueError('offline')):
+                with self.assertRaisesRegex(ValueError, 'offline'):
+                    build_index(chunks, path, paper_id, extend=True)
+            self.assertEqual((path / 'index.json').read_text(), original)
+            self.assertTrue(retrieve('control', root, directory=path, paper_id=paper_id))
+            build_index(chunks, path, paper_id, extend=True)
+            hits = retrieve('control', chunks, directory=path, paper_id=paper_id, document_id='paper')
+            self.assertTrue(hits)
+            self.assertTrue(all(hit['document_id'] == 'paper' for hit in hits))
+        self.assertEqual(question_document('핵심 방법을 쉽게 설명해줘'), 'paper')
+        self.assertIsNone(question_document('관련 논문과 비교해줘'))
 
     def test_answer_sends_real_image_input_and_rejects_unknown_citations(self):
         requests = []
@@ -91,6 +171,14 @@ class RagWorkspaceTests(unittest.TestCase):
             self.assertEqual({sid for c in own for sid in c['sentence_ids']}, {s['id'] for s in sentences})
             self.assertTrue(all(fake_token_count(c['text']) <= 400 for c in own))
             self.assertTrue(all(all(int(sid[1:])//4+1 == c['page'] for sid in c['sentence_ids']) for c in own))
+
+    def test_joined_sentence_token_count_cannot_overflow_chunk_limit(self):
+        sentences = [{'id': 's0', 'page': 0, 'text': 'a' * 200},
+                     {'id': 's1', 'page': 0, 'text': 'b' * 200}]
+        with patch('readpaper.rag._token_count', len):
+            chunks = build_chunks(sentences, [], 'Root')
+        self.assertTrue(all(len(chunk['text']) <= 400 for chunk in chunks))
+        self.assertEqual({sid for chunk in chunks for sid in chunk['sentence_ids']}, {'s0', 's1'})
 
     def test_qdrant_hybrid_index_and_model_mismatch(self):
         chunks = build_chunks([{'id':'s0','page':0,'text':'Robotic control learning.'},

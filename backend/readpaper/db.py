@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import settings
+from . import embedding_cache
 
 
 def connect() -> sqlite3.Connection:
@@ -65,6 +66,7 @@ def init_db() -> None:
 
 
 def cleanup_expired() -> None:
+    embedding_cache.cleanup(settings.data_dir, settings.paper_ttl_seconds)
     with connect() as db:
         cutoff = time.time() - settings.paper_ttl_seconds
         expired = db.execute("SELECT id FROM papers WHERE last_accessed < ?", (cutoff,)).fetchall()
